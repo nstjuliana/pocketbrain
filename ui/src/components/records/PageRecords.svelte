@@ -213,7 +213,7 @@
                 {#if $activeCollection.type !== "view"}
                     <button
                         type="button"
-                        class="btn btn-outline btn-hint"
+                        class="btn btn-outline"
                         use:tooltip={{ text: "Generate sample records using AI", position: "bottom" }}
                         on:click={() => seedDataPanel?.show()}
                     >

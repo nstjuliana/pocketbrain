@@ -305,11 +305,12 @@ Output format - Return ONLY valid JSON:
 
 CRITICAL RULES:
 - Field names: lowercase, alphanumeric, underscores only
+- ONLY use the field types listed above: text, number, bool, email, url, editor, date, select, json, file, relation, autodate
+- There is NO "tags" type - for tags/categories use "select" type with maxSelect > 1
 - For SELECT fields: ALWAYS include "values" as an array of strings and "maxSelect" as a number
 - For FILE fields: ALWAYS include "mimeTypes" as array, "maxSelect", and "maxSize"
 - Do NOT include system fields (id, created, updated) - added automatically
-- For auth collections, email/password fields are added automatically
-- If user mentions "tags" or multiple choices, use select with maxSelect > 1`
+- For auth collections, email/password fields are added automatically`
 
 	if collectionType == CollectionTypeAuth {
 		return basePrompt + "\n\nNote: This is an auth collection. Email and password fields will be added automatically."
@@ -415,7 +416,7 @@ func GenerateSeedDataFromSchema(app App, collection *Collection, count int, desc
 
 	// Make the request with longer timeout for larger data generation
 	client := &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout: 120 * time.Second,
 	}
 
 	resp, err := client.Do(httpReq)
@@ -560,10 +561,12 @@ OUTPUT FORMAT:
 func buildSeedDataUserPrompt(collectionName string, fields []SeedFieldInfo, count int, description string) string {
 	fieldsJSON, _ := json.MarshalIndent(fields, "", "  ")
 
-	prompt := fmt.Sprintf(`Generate %d sample records for a "%s" collection.
+	prompt := fmt.Sprintf(`Generate EXACTLY %d sample records for a "%s" collection.
+
+IMPORTANT: You MUST generate exactly %d records - no more, no less.
 
 Field Schema:
-%s`, count, collectionName, string(fieldsJSON))
+%s`, count, collectionName, count, string(fieldsJSON))
 
 	if description != "" {
 		prompt += fmt.Sprintf(`
@@ -573,9 +576,9 @@ Context/Description: %s
 Use this context to make the generated data more relevant and realistic.`, description)
 	}
 
-	prompt += `
+	prompt += fmt.Sprintf(`
 
-Return a JSON object with a "records" array containing the generated records.`
+Return a JSON object with a "records" array containing EXACTLY %d generated records.`, count)
 
 	return prompt
 }

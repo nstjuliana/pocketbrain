@@ -46,6 +46,13 @@
         return false;
     });
 
+    // Check for required relation fields - these will cause validation errors
+    $: requiredRelationFields = (collection?.fields || []).filter((f) => {
+        return f.type === "relation" && f.required;
+    });
+
+    $: hasRequiredRelations = requiredRelationFields.length > 0;
+
     export function show() {
         result = null;
         count = 10;
@@ -169,20 +176,37 @@
             </div>
         {/if}
 
-        {#if skippedFields.length > 0}
-            <div class="skipped-fields m-t-sm" transition:slide={{ duration: 150 }}>
-                <p class="txt-hint txt-sm">
-                    <i class="ri-skip-forward-line" aria-hidden="true" />
-                    Skipped: {skippedFields.map((f) => f.name).join(", ")}
-                    <i
-                        class="ri-information-line link-hint"
-                        use:tooltip={{
-                            text: "Relation, file, autodate, and password fields cannot be auto-generated",
-                            position: "top",
-                        }}
-                    />
-                </p>
+        {#if hasRequiredRelations}
+            <div class="alert alert-warning m-t-base" transition:slide={{ duration: 150 }}>
+                <i class="ri-error-warning-line" />
+                <div>
+                    <strong>Required relation field{requiredRelationFields.length > 1 ? "s" : ""}:</strong>
+                    {requiredRelationFields.map((f) => f.name).join(", ")}
+                    <p class="txt-sm m-t-5 m-b-0">
+                        Relation fields can't be auto-generated. Records will fail validation unless you 
+                        make these fields optional or manually add related records first.
+                    </p>
+                </div>
             </div>
+        {/if}
+
+        {#if skippedFields.length > 0}
+            {@const otherSkipped = skippedFields.filter(f => !f.required || f.type !== "relation")}
+            {#if otherSkipped.length > 0}
+                <div class="skipped-fields m-t-sm" transition:slide={{ duration: 150 }}>
+                    <p class="txt-hint txt-sm">
+                        <i class="ri-skip-forward-line" aria-hidden="true" />
+                        Skipped: {otherSkipped.map((f) => f.name).join(", ")}
+                        <i
+                            class="ri-information-line link-hint"
+                            use:tooltip={{
+                                text: "Relation, file, autodate, and password fields cannot be auto-generated",
+                                position: "top",
+                            }}
+                        />
+                    </p>
+                </div>
+            {/if}
         {/if}
 
         {#if result}
@@ -199,6 +223,11 @@
                         {#if result.skipped > 0}
                             <span class="txt-hint">
                                 ({result.skipped} skipped due to validation errors)
+                            </span>
+                        {/if}
+                        {#if result.total < count && result.skipped === 0}
+                            <span class="txt-hint">
+                                (AI returned {result.total} instead of {count})
                             </span>
                         {/if}
                     </div>
@@ -299,12 +328,25 @@
 
     .alert {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 8px;
     }
 
     .alert i {
         font-size: 1.1em;
+        flex-shrink: 0;
+        margin-top: 2px;
+    }
+
+    .alert-warning {
+        background: var(--warningAltColor);
+        color: var(--txtPrimaryColor);
+        padding: 12px;
+        border-radius: var(--baseRadius);
+    }
+
+    .alert-warning strong {
+        color: var(--warningColor);
     }
 
     textarea {
