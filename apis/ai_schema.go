@@ -22,6 +22,7 @@ func bindAIApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	subGroup.GET("/embedding-stats", aiGetEmbeddingStats)
 	subGroup.GET("/embedding-cache-stats", aiGetEmbeddingCacheStats)
 	subGroup.POST("/clear-embedding-cache", aiClearEmbeddingCache)
+	subGroup.GET("/pending-embeddings", aiGetPendingEmbeddings)
 }
 
 func aiGenerateSchema(e *core.RequestEvent) error {
@@ -298,5 +299,25 @@ func aiGetEmbeddingCacheStats(e *core.RequestEvent) error {
 func aiClearEmbeddingCache(e *core.RequestEvent) error {
 	core.ClearEmbeddingCache()
 	return e.JSON(http.StatusOK, map[string]string{"status": "ok", "message": "Embedding cache cleared"})
+}
+
+// aiGetPendingEmbeddings returns record IDs that need embeddings.
+func aiGetPendingEmbeddings(e *core.RequestEvent) error {
+	collectionId := e.Request.URL.Query().Get("collectionId")
+	fieldName := e.Request.URL.Query().Get("fieldName")
+
+	if collectionId == "" || fieldName == "" {
+		return e.BadRequestError("Both 'collectionId' and 'fieldName' query parameters are required.", nil)
+	}
+
+	recordIds, err := core.GetPendingEmbeddingRecordIds(e.App, collectionId, fieldName)
+	if err != nil {
+		return e.BadRequestError("Failed to get pending embeddings: "+err.Error(), nil)
+	}
+
+	return e.JSON(http.StatusOK, map[string]any{
+		"recordIds": recordIds,
+		"count":     len(recordIds),
+	})
 }
 

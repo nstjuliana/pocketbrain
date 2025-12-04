@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"strings"
 )
 
 const (
@@ -11,6 +12,8 @@ const (
 
 // EnsureEmbeddingsCollection creates the _embeddings system collection if it doesn't exist.
 // Returns the embeddings collection.
+// This function is safe to call concurrently - if multiple goroutines try to create
+// the collection simultaneously, all but one will find it already exists.
 func EnsureEmbeddingsCollection(app App) (*Collection, error) {
 	// Try to find existing collection
 	collection, err := app.FindCollectionByNameOrId(EmbeddingsCollectionName)
@@ -68,6 +71,18 @@ func EnsureEmbeddingsCollection(app App) (*Collection, error) {
 
 	// Save the collection
 	if err := app.Save(collection); err != nil {
+		// Handle race condition: if another goroutine created the collection
+		// at the same time, we'll get a constraint/uniqueness error. In that case,
+		// just find and return the existing collection.
+		errStr := err.Error()
+		if strings.Contains(errStr, "UNIQUE constraint failed") ||
+			strings.Contains(errStr, "already exists") ||
+			strings.Contains(errStr, "must be unique") {
+			collection, findErr := app.FindCollectionByNameOrId(EmbeddingsCollectionName)
+			if findErr == nil {
+				return collection, nil
+			}
+		}
 		return nil, fmt.Errorf("failed to create embeddings collection: %w", err)
 	}
 
@@ -226,5 +241,64 @@ func GetEmbeddingStatsForField(app App, collectionId, fieldName string) (*Embedd
 		EmbeddedRecords:    len(embeddedRecords),
 		NotEmbeddedRecords: totalRecords - len(embeddedRecords),
 	}, nil
+}
+
+// GetPendingEmbeddingRecordIds returns IDs of records that don't have embeddings yet
+func GetPendingEmbeddingRecordIds(app App, collectionId, fieldName string) ([]string, error) {
+	// Get the source collection
+	collection, err := app.FindCollectionByNameOrId(collectionId)
+	if err != nil {
+		return nil, fmt.Errorf("collection not found: %w", err)
+	}
+
+	// Get all record IDs from the source collection
+	allRecords, err := app.FindAllRecords(collection.Id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch records: %w", err)
+	}
+
+	allIds := make(map[string]bool)
+	for _, record := range allRecords {
+		allIds[record.Id] = true
+	}
+
+	// Get embedded record IDs
+	embeddingsCollection, err := app.FindCollectionByNameOrId(EmbeddingsCollectionName)
+	if err != nil {
+		// No embeddings collection yet, return all IDs
+		result := make([]string, 0, len(allIds))
+		for id := range allIds {
+			result = append(result, id)
+		}
+		return result, nil
+	}
+
+	embeddedRecords, err := app.FindRecordsByFilter(
+		embeddingsCollection.Id,
+		"collection_id = {:collectionId} && field_name = {:fieldName}",
+		"",
+		0,
+		0,
+		map[string]any{
+			"collectionId": collection.Id,
+			"fieldName":    fieldName,
+		},
+	)
+	if err != nil {
+		embeddedRecords = []*Record{}
+	}
+
+	// Remove already embedded IDs
+	for _, embRecord := range embeddedRecords {
+		recordId := embRecord.GetString("record_id")
+		delete(allIds, recordId)
+	}
+
+	// Return pending IDs
+	result := make([]string, 0, len(allIds))
+	for id := range allIds {
+		result = append(result, id)
+	}
+	return result, nil
 }
 

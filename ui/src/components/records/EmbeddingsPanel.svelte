@@ -19,6 +19,9 @@
     let result = null;
     let stats = null;
     let isLoadingStats = false;
+    
+    // Progress tracking for batched generation
+    let progress = null; // { total, completed, generated, skipped, errors }
 
     // Get embeddable fields from collection (text and editor types)
     $: embeddableFields = (collection?.fields || []).filter((f) => {
@@ -81,40 +84,140 @@
         return panel?.hide();
     }
 
+    const BATCH_SIZE = 1000;
+    const PARALLEL_BATCHES = 10; // Number of concurrent API calls
+
     async function generateEmbeddings() {
         if (isGenerating || !collection?.id) return;
         if (embeddingMode === "field" && !selectedField) return;
 
         isGenerating = true;
         result = null;
+        progress = null;
+
+        const fieldName = embeddingMode === "record" ? "_record" : selectedField;
 
         try {
-            const body = {
-                collectionId: collection.id,
-                mode: embeddingMode,
-            };
+            // Get pending record IDs
+            const pendingResponse = await ApiClient.send(
+                `/api/ai/pending-embeddings?collectionId=${collection.id}&fieldName=${fieldName}`,
+                { method: "GET" }
+            );
+
+            const pendingIds = pendingResponse.recordIds || [];
             
-            if (embeddingMode === "field") {
-                body.fieldName = selectedField;
-            } else if (customTemplate.trim()) {
-                body.template = customTemplate.trim();
+            if (pendingIds.length === 0) {
+                result = { generated: 0, skipped: 0 };
+                addSuccessToast("All records already have embeddings");
+                isGenerating = false;
+                return;
             }
 
-            result = await ApiClient.send("/api/ai/generate-embeddings", {
-                method: "POST",
-                body,
-            });
+            // Initialize progress
+            progress = {
+                total: pendingIds.length,
+                completed: 0,
+                generated: 0,
+                skipped: 0,
+                errors: [],
+            };
 
-            if (result.generated > 0) {
-                addSuccessToast(`Generated embeddings for ${result.generated} record${result.generated !== 1 ? "s" : ""}`);
+            // Split into batches
+            const batches = [];
+            for (let i = 0; i < pendingIds.length; i += BATCH_SIZE) {
+                batches.push(pendingIds.slice(i, i + BATCH_SIZE));
+            }
+
+            // Process a single batch
+            async function processBatch(batch, batchIndex) {
+                const body = {
+                    collectionId: collection.id,
+                    mode: embeddingMode,
+                    recordIds: batch,
+                };
+                
+                if (embeddingMode === "field") {
+                    body.fieldName = selectedField;
+                } else if (customTemplate.trim()) {
+                    body.template = customTemplate.trim();
+                }
+
+                try {
+                    const batchResult = await ApiClient.send("/api/ai/generate-embeddings", {
+                        method: "POST",
+                        body,
+                        // Disable auto-cancellation for parallel requests
+                        requestKey: `embeddings-batch-${batchIndex}`,
+                    });
+
+                    return {
+                        success: true,
+                        generated: batchResult.generated || 0,
+                        skipped: batchResult.skipped || 0,
+                        errors: batchResult.errors || [],
+                        count: batch.length,
+                    };
+                } catch (err) {
+                    return {
+                        success: false,
+                        generated: 0,
+                        skipped: 0,
+                        errors: [`Batch ${batchIndex + 1}: ${err?.data?.message || err?.message || "Failed"}`],
+                        count: batch.length,
+                    };
+                }
+            }
+
+            // Process batches in parallel with concurrency limit
+            let batchIndex = 0;
+            const runningBatches = new Set();
+
+            while (batchIndex < batches.length || runningBatches.size > 0) {
+                // Start new batches up to the concurrency limit
+                while (runningBatches.size < PARALLEL_BATCHES && batchIndex < batches.length) {
+                    const currentIndex = batchIndex;
+                    const batch = batches[currentIndex];
+                    batchIndex++;
+
+                    const batchPromise = processBatch(batch, currentIndex).then((result) => {
+                        // Update progress
+                        progress.generated += result.generated;
+                        progress.skipped += result.skipped;
+                        progress.completed += result.count;
+                        if (result.errors.length > 0) {
+                            progress.errors = [...progress.errors, ...result.errors].slice(0, 10);
+                        }
+                        progress = progress; // Trigger reactivity
+                        
+                        runningBatches.delete(batchPromise);
+                        return result;
+                    });
+
+                    runningBatches.add(batchPromise);
+                }
+
+                // Wait for at least one batch to complete before continuing
+                if (runningBatches.size > 0) {
+                    await Promise.race(runningBatches);
+                }
+            }
+
+            // Final result
+            result = {
+                generated: progress.generated,
+                skipped: progress.skipped,
+                errors: progress.errors.length > 0 ? progress.errors : undefined,
+            };
+
+            if (progress.generated > 0) {
+                addSuccessToast(`Generated embeddings for ${progress.generated} record${progress.generated !== 1 ? "s" : ""}`);
                 dispatch("generated", result);
-                // Reload stats after generation
-                loadStats();
-            } else if (result.skipped > 0) {
-                addSuccessToast(`All ${result.skipped} records already have embeddings or are empty`);
-            } else {
-                addErrorToast("No embeddings were generated");
+            } else if (progress.skipped > 0) {
+                addSuccessToast(`All ${progress.skipped} records were skipped (empty content)`);
             }
+
+            // Reload stats after generation
+            loadStats();
         } catch (err) {
             ApiClient.error(err);
             result = { error: err?.data?.message || err?.message || "Failed to generate embeddings" };
@@ -297,12 +400,50 @@
             {/if}
 
             <!-- Info -->
-            <div class="info-section m-b-base">
-                <p class="txt-hint txt-sm">
-                    <i class="ri-information-line" />
-                    Embeddings are generated using OpenAI's embedding model. Records with existing embeddings will be updated.
-                </p>
-            </div>
+            {#if !isGenerating}
+                <div class="info-section m-b-base">
+                    <p class="txt-hint txt-sm">
+                        <i class="ri-information-line" />
+                        Embeddings are generated using OpenAI's embedding model. Records with existing embeddings will be updated.
+                    </p>
+                </div>
+            {/if}
+
+            <!-- Progress during generation -->
+            {#if isGenerating && progress}
+                <div class="generation-progress m-b-base" transition:slide={{ duration: 150 }}>
+                    <div class="progress-header">
+                        <span class="progress-title">
+                            <i class="ri-loader-4-line spinning" />
+                            Generating embeddings...
+                        </span>
+                        <span class="progress-count">
+                            {formatNumber(progress.completed)} / {formatNumber(progress.total)}
+                        </span>
+                    </div>
+                    <div class="progress-bar">
+                        <div 
+                            class="progress-fill active" 
+                            style="width: {(progress.completed / progress.total) * 100}%"
+                        />
+                    </div>
+                    <div class="progress-details">
+                        <span class="txt-success">
+                            <i class="ri-check-line" /> {formatNumber(progress.generated)} generated
+                        </span>
+                        {#if progress.skipped > 0}
+                            <span class="txt-hint">
+                                <i class="ri-skip-forward-line" /> {formatNumber(progress.skipped)} skipped
+                            </span>
+                        {/if}
+                        {#if progress.errors.length > 0}
+                            <span class="txt-danger">
+                                <i class="ri-error-warning-line" /> {progress.errors.length} error{progress.errors.length !== 1 ? "s" : ""}
+                            </span>
+                        {/if}
+                    </div>
+                </div>
+            {/if}
 
             {#if result}
                 <div class="result m-t-base" transition:slide={{ duration: 150 }}>
@@ -428,6 +569,66 @@
         height: 100%;
         background: var(--successColor);
         transition: width 0.3s ease;
+    }
+
+    .progress-fill.active {
+        background: linear-gradient(
+            90deg,
+            var(--primaryColor) 0%,
+            var(--successColor) 100%
+        );
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
+    }
+
+    /* Generation progress */
+    .generation-progress {
+        background: var(--baseAlt1Color);
+        border-radius: var(--baseRadius);
+        padding: 16px;
+        border: 1px solid var(--primaryColor);
+    }
+
+    .progress-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 12px;
+    }
+
+    .progress-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+        color: var(--primaryColor);
+    }
+
+    .progress-count {
+        font-family: monospace;
+        color: var(--txtHintColor);
+    }
+
+    .progress-details {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        margin-top: 12px;
+        font-size: 0.85em;
+    }
+
+    .progress-details span {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+
+    .spinning {
+        animation: spin 1s linear infinite;
     }
 
     .stats-loading {
