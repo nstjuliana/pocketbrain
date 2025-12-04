@@ -104,10 +104,10 @@ func aiGenerateSeedData(e *core.RequestEvent) error {
 		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
 	}
 
-	// Validate request - now supports up to 10,000 records
+	// Validate request - now supports up to 1,000,000 records
 	if err := validation.ValidateStruct(&req,
 		validation.Field(&req.CollectionId, validation.Required),
-		validation.Field(&req.Count, validation.Required, validation.Min(1), validation.Max(10000)),
+		validation.Field(&req.Count, validation.Required, validation.Min(1), validation.Max(1000000)),
 	); err != nil {
 		return e.BadRequestError("Invalid request data.", err)
 	}

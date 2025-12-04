@@ -423,15 +423,10 @@
     <div class="chat-panel">
         <div class="chat-messages" bind:this={chatContainer}>
             {#if messages.length === 0}
-                <div class="chat-message chat-message-system">
+                <div class="chat-message chat-message-system compact-welcome">
                     <div class="chat-message-content">
-                        <p><strong>AI Schema Designer</strong></p>
-                        <p>Describe your schema and I'll help you build it:</p>
-                        <ul>
-                            <li>"Create a blog with title, content, author"</li>
-                            <li>"Add a tags field for categories"</li>
-                            <li>"I need a status field with draft/published options"</li>
-                        </ul>
+                        <p><strong>AI Schema Designer</strong> — Describe your schema:</p>
+                        <p class="examples">"blog with title, content" · "add tags field" · "status: draft/published"</p>
                     </div>
                 </div>
             {/if}
@@ -556,9 +551,10 @@
 <style>
     .schema-chat-container {
         display: grid;
-        grid-template-columns: 1fr 300px;
-        gap: 16px;
-        height: 500px;
+        grid-template-columns: 1fr 280px;
+        gap: 12px;
+        height: 100%;
+        min-height: 400px;
     }
 
     /* Chat Panel */
@@ -574,10 +570,10 @@
     .chat-messages {
         flex: 1;
         overflow-y: auto;
-        padding: var(--baseSpacing);
+        padding: 12px;
         display: flex;
         flex-direction: column;
-        gap: 12px;
+        gap: 10px;
     }
 
     .chat-message {
@@ -592,16 +588,18 @@
         background: var(--primaryColor);
         color: var(--primaryTextColor);
         border-radius: var(--borderRadius);
-        padding: 10px 14px;
+        padding: 8px 12px;
         max-width: 85%;
+        font-size: 0.9em;
     }
 
     .chat-message-assistant .chat-message-content,
     .chat-message-system .chat-message-content {
         background: var(--baseAlt1Color);
         border-radius: var(--borderRadius);
-        padding: 10px 14px;
+        padding: 8px 12px;
         max-width: 85%;
+        font-size: 0.9em;
     }
 
     .chat-message-assistant.error .chat-message-content {
@@ -609,8 +607,20 @@
         color: var(--dangerColor);
     }
 
+    /* Compact welcome message */
+    .compact-welcome .chat-message-content {
+        max-width: 100%;
+        padding: 10px 14px;
+    }
+
+    .compact-welcome .examples {
+        font-size: 0.85em;
+        color: var(--txtHintColor);
+        font-style: italic;
+    }
+
     .chat-message-content p {
-        margin: 0 0 0.5em 0;
+        margin: 0 0 0.4em 0;
     }
     .chat-message-content p:last-child {
         margin-bottom: 0;
@@ -629,7 +639,7 @@
 
     .chat-input-wrapper {
         border-top: 1px solid var(--borderColor);
-        padding: 12px;
+        padding: 10px;
     }
 
     .chat-input-container {
@@ -640,13 +650,13 @@
 
     .chat-input {
         flex: 1;
-        min-height: 44px;
-        max-height: 100px;
-        padding: 10px 12px;
+        min-height: 38px;
+        max-height: 80px;
+        padding: 8px 10px;
         border: 1px solid var(--borderColor);
         border-radius: var(--borderRadius);
         font-family: inherit;
-        font-size: inherit;
+        font-size: 0.9em;
         resize: none;
         background: var(--baseAlt1Color);
     }
@@ -725,8 +735,9 @@
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        height: 100%;
+        padding: 20px 10px;
         color: var(--txtHintColor);
+        font-size: 0.85em;
         text-align: center;
         padding: 20px;
     }

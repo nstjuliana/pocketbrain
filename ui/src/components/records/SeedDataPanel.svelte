@@ -13,24 +13,28 @@
 
     // Hybrid threshold - matches backend constant
     const HYBRID_THRESHOLD = 20;
-    const MAX_COUNT = 10000;
+    const MAX_COUNT = 1000000;
 
     let panel;
-    let count = 50;
+    let count = 100;
     let description = "";
     let isGenerating = false;
     let result = null;
 
     // Quick presets for count selection
-    const countPresets = [10, 50, 100, 500, 1000, 5000, 10000];
+    const countPresets = [10, 100, 1000, 10000, 100000, 1000000];
+
+    // Safe count value (handles null/empty input)
+    $: safeCount = (count && !isNaN(count)) ? Math.max(1, Math.min(MAX_COUNT, parseInt(count))) : 1;
 
     // Determine if fast mode (hybrid) will be used
-    $: isFastMode = count > HYBRID_THRESHOLD;
+    $: isFastMode = safeCount > HYBRID_THRESHOLD;
 
     // Estimated time based on count and mode
-    $: estimatedTime = getEstimatedTime(count);
+    $: estimatedTime = getEstimatedTime(safeCount);
 
     function getEstimatedTime(n) {
+        if (!n || isNaN(n)) return "~2s";
         if (n <= HYBRID_THRESHOLD) {
             // Pure AI mode: ~2-5 seconds
             return `~${Math.max(2, Math.ceil(n / 5))}s (AI)`;
@@ -38,9 +42,16 @@
             // Hybrid mode: much faster
             if (n <= 100) return "~2-3s";
             if (n <= 1000) return "~3-5s";
-            if (n <= 5000) return "~5-8s";
-            return "~8-15s";
+            if (n <= 10000) return "~5-15s";
+            if (n <= 100000) return "~30s-2min";
+            return "~2-5min";
         }
+    }
+
+    // Safe number formatting
+    function formatNumber(n) {
+        if (n === null || n === undefined || n === "" || isNaN(n)) return "0";
+        return Number(n).toLocaleString();
     }
 
     // Fields that will be generated (for display)
@@ -81,7 +92,7 @@
 
     export function show() {
         result = null;
-        count = 50;
+        count = 100;
         description = "";
         return panel?.show();
     }
@@ -91,7 +102,7 @@
     }
 
     async function generateSeedData() {
-        if (isGenerating || !collection?.id) return;
+        if (isGenerating || !collection?.id || !safeCount) return;
 
         isGenerating = true;
         result = null;
@@ -99,7 +110,7 @@
         try {
             result = await ApiClient.ai.generateSeedData({
                 collectionId: collection.id,
-                count: count,
+                count: safeCount,
                 description: description || undefined,
             });
 
@@ -126,10 +137,6 @@
 
     function setCount(preset) {
         count = preset;
-    }
-
-    function formatNumber(n) {
-        return n.toLocaleString();
     }
 </script>
 
@@ -312,9 +319,9 @@
                                     ({formatNumber(result.skipped)} skipped due to validation errors)
                                 </span>
                             {/if}
-                            {#if result.total < count && result.skipped === 0}
+                            {#if result.total < safeCount && result.skipped === 0}
                                 <span class="txt-hint">
-                                    (AI returned {formatNumber(result.total)} instead of {formatNumber(count)})
+                                    (AI returned {formatNumber(result.total)} instead of {formatNumber(safeCount)})
                                 </span>
                             {/if}
                         </div>
@@ -351,7 +358,7 @@
             {:else}
                 <i class="ri-magic-line" aria-hidden="true" />
             {/if}
-            <span class="txt">Generate {formatNumber(count)} Record{count !== 1 ? "s" : ""}</span>
+            <span class="txt">Generate {formatNumber(safeCount)} Record{safeCount !== 1 ? "s" : ""}</span>
         </button>
     </svelte:fragment>
 </OverlayPanel>

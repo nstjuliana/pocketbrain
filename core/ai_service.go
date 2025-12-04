@@ -891,25 +891,222 @@ Remember:
 }
 
 // multiplyArchetypes generates records by mutating archetypes with gofakeit
+// Uses parallel workers for large counts to maximize throughput
 func multiplyArchetypes(archetypes []map[string]any, fields []SeedFieldInfo, count int) []map[string]any {
-	records := make([]map[string]any, 0, count)
-
 	// Build a field type map for quick lookup
 	fieldTypes := make(map[string]SeedFieldInfo)
 	for _, f := range fields {
 		fieldTypes[f.Name] = f
 	}
 
-	for i := 0; i < count; i++ {
-		// Pick a random archetype
-		archetype := archetypes[rand.Intn(len(archetypes))]
-
-		// Create a new record by mutating the archetype
-		record := mutateArchetype(archetype, fieldTypes)
-		records = append(records, record)
+	// For small counts, use simple sequential generation
+	if count <= 1000 {
+		records := make([]map[string]any, 0, count)
+		for i := 0; i < count; i++ {
+			archetype := archetypes[rand.Intn(len(archetypes))]
+			record := mutateArchetype(archetype, fieldTypes)
+			records = append(records, record)
+		}
+		return records
 	}
 
+	// For large counts, use parallel generation with worker pool
+	return multiplyArchetypesParallel(archetypes, fieldTypes, count)
+}
+
+// multiplyArchetypesParallel generates records using multiple goroutines
+func multiplyArchetypesParallel(archetypes []map[string]any, fieldTypes map[string]SeedFieldInfo, count int) []map[string]any {
+	// Determine number of workers (use available CPUs, cap at 8)
+	numWorkers := 8
+	
+	// Pre-allocate result slice
+	records := make([]map[string]any, count)
+	
+	// Calculate records per worker
+	chunkSize := count / numWorkers
+	remainder := count % numWorkers
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	startIdx := 0
+	for w := 0; w < numWorkers; w++ {
+		// Distribute remainder among first workers
+		workerCount := chunkSize
+		if w < remainder {
+			workerCount++
+		}
+		
+		endIdx := startIdx + workerCount
+		
+		// Launch worker goroutine
+		go func(start, end int) {
+			defer wg.Done()
+			
+			// Each worker has its own random source for thread safety
+			localRand := rand.New(rand.NewSource(time.Now().UnixNano() + int64(start)))
+			
+			for i := start; i < end; i++ {
+				// Pick a random archetype
+				archetype := archetypes[localRand.Intn(len(archetypes))]
+				// Generate record (mutateArchetype is thread-safe with local rand)
+				records[i] = mutateArchetypeWithRand(archetype, fieldTypes, localRand)
+			}
+		}(startIdx, endIdx)
+		
+		startIdx = endIdx
+	}
+
+	wg.Wait()
 	return records
+}
+
+// mutateArchetypeWithRand is a thread-safe version using a local random source
+func mutateArchetypeWithRand(archetype map[string]any, fieldTypes map[string]SeedFieldInfo, localRand *rand.Rand) map[string]any {
+	record := make(map[string]any)
+
+	for fieldName, value := range archetype {
+		fieldInfo, hasInfo := fieldTypes[fieldName]
+
+		switch v := value.(type) {
+		case string:
+			record[fieldName] = mutateStringFieldWithRand(v, fieldName, fieldInfo, hasInfo, localRand)
+		case float64:
+			if hasInfo && fieldInfo.Type == FieldTypeNumber {
+				record[fieldName] = mutateNumberFieldWithRand(fieldInfo, localRand)
+			} else {
+				record[fieldName] = v
+			}
+		case bool:
+			if localRand.Float32() < 0.3 {
+				record[fieldName] = !v
+			} else {
+				record[fieldName] = v
+			}
+		case []interface{}:
+			if hasInfo && fieldInfo.Type == FieldTypeSelect && len(fieldInfo.Values) > 0 {
+				record[fieldName] = mutateSelectFieldWithRand(fieldInfo, localRand)
+			} else {
+				record[fieldName] = v
+			}
+		default:
+			record[fieldName] = value
+		}
+	}
+
+	return record
+}
+
+// mutateStringFieldWithRand is thread-safe string mutation
+func mutateStringFieldWithRand(value, fieldName string, fieldInfo SeedFieldInfo, hasInfo bool, localRand *rand.Rand) string {
+	result := value
+
+	// Replace placeholders using gofakeit (which is thread-safe)
+	if strings.Contains(result, "{{NAME}}") {
+		result = strings.ReplaceAll(result, "{{NAME}}", gofakeit.Name())
+	}
+	if strings.Contains(result, "{{FIRSTNAME}}") {
+		result = strings.ReplaceAll(result, "{{FIRSTNAME}}", gofakeit.FirstName())
+	}
+	if strings.Contains(result, "{{LASTNAME}}") {
+		result = strings.ReplaceAll(result, "{{LASTNAME}}", gofakeit.LastName())
+	}
+	if strings.Contains(result, "{{EMAIL}}") {
+		result = strings.ReplaceAll(result, "{{EMAIL}}", gofakeit.Email())
+	}
+	if strings.Contains(result, "{{URL}}") {
+		result = strings.ReplaceAll(result, "{{URL}}", gofakeit.URL())
+	}
+	if strings.Contains(result, "{{USERNAME}}") {
+		result = strings.ReplaceAll(result, "{{USERNAME}}", gofakeit.Username())
+	}
+	if strings.Contains(result, "{{TITLE}}") {
+		result = strings.ReplaceAll(result, "{{TITLE}}", gofakeit.Sentence(localRand.Intn(5)+3))
+	}
+	if strings.Contains(result, "{{COMPANY}}") {
+		result = strings.ReplaceAll(result, "{{COMPANY}}", gofakeit.Company())
+	}
+	if strings.Contains(result, "{{CITY}}") {
+		result = strings.ReplaceAll(result, "{{CITY}}", gofakeit.City())
+	}
+	if strings.Contains(result, "{{COUNTRY}}") {
+		result = strings.ReplaceAll(result, "{{COUNTRY}}", gofakeit.Country())
+	}
+	if strings.Contains(result, "{{JOBTITLE}}") {
+		result = strings.ReplaceAll(result, "{{JOBTITLE}}", gofakeit.JobTitle())
+	}
+	if strings.Contains(result, "{{PHONE}}") {
+		result = strings.ReplaceAll(result, "{{PHONE}}", gofakeit.Phone())
+	}
+
+	if hasInfo {
+		switch fieldInfo.Type {
+		case FieldTypeEmail:
+			if result == "{{EMAIL}}" || result == "" {
+				return gofakeit.Email()
+			}
+		case FieldTypeURL:
+			if result == "{{URL}}" || result == "" {
+				return gofakeit.URL()
+			}
+		case FieldTypeSelect:
+			if len(fieldInfo.Values) > 0 && fieldInfo.MaxSelect <= 1 {
+				return fieldInfo.Values[localRand.Intn(len(fieldInfo.Values))]
+			}
+		}
+	}
+
+	lowerName := strings.ToLower(fieldName)
+	if result == value {
+		if strings.Contains(lowerName, "email") {
+			return gofakeit.Email()
+		}
+		if strings.Contains(lowerName, "phone") {
+			return gofakeit.Phone()
+		}
+		if strings.Contains(lowerName, "username") || lowerName == "user" {
+			return gofakeit.Username()
+		}
+	}
+
+	return result
+}
+
+// mutateNumberFieldWithRand generates a random number with local rand
+func mutateNumberFieldWithRand(fieldInfo SeedFieldInfo, localRand *rand.Rand) float64 {
+	min := fieldInfo.Min
+	max := fieldInfo.Max
+	if min == 0 && max == 0 {
+		min = 0
+		max = 1000
+	} else if max == 0 {
+		max = min + 1000
+	}
+	return min + localRand.Float64()*(max-min)
+}
+
+// mutateSelectFieldWithRand picks random values with local rand
+func mutateSelectFieldWithRand(fieldInfo SeedFieldInfo, localRand *rand.Rand) interface{} {
+	if len(fieldInfo.Values) == 0 {
+		return ""
+	}
+
+	if fieldInfo.MaxSelect <= 1 {
+		return fieldInfo.Values[localRand.Intn(len(fieldInfo.Values))]
+	}
+
+	numSelections := localRand.Intn(fieldInfo.MaxSelect) + 1
+	if numSelections > len(fieldInfo.Values) {
+		numSelections = len(fieldInfo.Values)
+	}
+
+	shuffled := make([]string, len(fieldInfo.Values))
+	copy(shuffled, fieldInfo.Values)
+	localRand.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+
+	return shuffled[:numSelections]
 }
 
 // mutateArchetype creates a new record by replacing placeholders and randomizing fields
