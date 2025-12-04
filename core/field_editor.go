@@ -61,6 +61,11 @@ type EditorField struct {
 
 	// Required will require the field value to be non-empty string.
 	Required bool `form:"required" json:"required"`
+
+	// Embeddable marks this editor field as eligible for vector embedding generation.
+	// When enabled, users can generate vector embeddings for this field's content
+	// which are stored in a separate _embeddings collection for similarity search.
+	Embeddable bool `form:"embeddable" json:"embeddable"`
 }
 
 // Type implements [Field.Type] interface method.

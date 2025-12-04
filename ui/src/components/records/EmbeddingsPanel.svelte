@@ -1,0 +1,774 @@
+<script>
+    import { createEventDispatcher } from "svelte";
+    import { slide } from "svelte/transition";
+    import ApiClient from "@/utils/ApiClient";
+    import { addSuccessToast, addErrorToast } from "@/stores/toasts";
+    import tooltip from "@/actions/tooltip";
+    import OverlayPanel from "@/components/base/OverlayPanel.svelte";
+    import Field from "@/components/base/Field.svelte";
+
+    const dispatch = createEventDispatcher();
+
+    export let collection;
+
+    let panel;
+    let embeddingMode = "field"; // "field" or "record"
+    let selectedField = "";
+    let customTemplate = "";
+    let isGenerating = false;
+    let result = null;
+    let stats = null;
+    let isLoadingStats = false;
+    
+    // Progress tracking for batched generation
+    let progress = null; // { total, completed, generated, skipped, errors }
+
+    // Get embeddable fields from collection (text and editor types)
+    $: embeddableFields = (collection?.fields || []).filter((f) => {
+        return (f.type === "text" || f.type === "editor") && f.embeddable;
+    });
+
+    // Get all text/editor fields for record-level mode preview
+    $: textFields = (collection?.fields || []).filter((f) => {
+        return f.type === "text" || f.type === "editor" || f.type === "email" || f.type === "url";
+    });
+
+    $: hasEmbeddableFields = embeddableFields.length > 0;
+
+    // Can always do record-level embedding if there are any text fields
+    $: canEmbedRecords = textFields.length > 0;
+
+    // Auto-select first embeddable field
+    $: if (embeddableFields.length > 0 && !selectedField) {
+        selectedField = embeddableFields[0].name;
+    }
+
+    // Load stats when field or mode changes
+    $: if (collection?.id && (embeddingMode === "record" || selectedField)) {
+        loadStats();
+    }
+
+    async function loadStats() {
+        if (!collection?.id) return;
+        
+        const fieldName = embeddingMode === "record" ? "_record" : selectedField;
+        if (!fieldName) return;
+        
+        isLoadingStats = true;
+        stats = null;
+        
+        try {
+            stats = await ApiClient.send(`/api/ai/embedding-stats?collectionId=${collection.id}&fieldName=${fieldName}`, {
+                method: "GET",
+            });
+        } catch (err) {
+            console.error("Failed to load embedding stats:", err);
+        }
+        
+        isLoadingStats = false;
+    }
+
+    export function show() {
+        result = null;
+        stats = null;
+        embeddingMode = "field";
+        selectedField = embeddableFields.length > 0 ? embeddableFields[0].name : "";
+        customTemplate = "";
+        if (selectedField || embeddingMode === "record") {
+            loadStats();
+        }
+        return panel?.show();
+    }
+
+    export function hide() {
+        return panel?.hide();
+    }
+
+    const BATCH_SIZE = 1000;
+    const PARALLEL_BATCHES = 10; // Number of concurrent API calls
+
+    async function generateEmbeddings() {
+        if (isGenerating || !collection?.id) return;
+        if (embeddingMode === "field" && !selectedField) return;
+
+        isGenerating = true;
+        result = null;
+        progress = null;
+
+        const fieldName = embeddingMode === "record" ? "_record" : selectedField;
+
+        try {
+            // Get pending record IDs
+            const pendingResponse = await ApiClient.send(
+                `/api/ai/pending-embeddings?collectionId=${collection.id}&fieldName=${fieldName}`,
+                { method: "GET" }
+            );
+
+            const pendingIds = pendingResponse.recordIds || [];
+            
+            if (pendingIds.length === 0) {
+                result = { generated: 0, skipped: 0 };
+                addSuccessToast("All records already have embeddings");
+                isGenerating = false;
+                return;
+            }
+
+            // Initialize progress
+            progress = {
+                total: pendingIds.length,
+                completed: 0,
+                generated: 0,
+                skipped: 0,
+                errors: [],
+            };
+
+            // Split into batches
+            const batches = [];
+            for (let i = 0; i < pendingIds.length; i += BATCH_SIZE) {
+                batches.push(pendingIds.slice(i, i + BATCH_SIZE));
+            }
+
+            // Process a single batch
+            async function processBatch(batch, batchIndex) {
+                const body = {
+                    collectionId: collection.id,
+                    mode: embeddingMode,
+                    recordIds: batch,
+                };
+                
+                if (embeddingMode === "field") {
+                    body.fieldName = selectedField;
+                } else if (customTemplate.trim()) {
+                    body.template = customTemplate.trim();
+                }
+
+                try {
+                    const batchResult = await ApiClient.send("/api/ai/generate-embeddings", {
+                        method: "POST",
+                        body,
+                        // Disable auto-cancellation for parallel requests
+                        requestKey: `embeddings-batch-${batchIndex}`,
+                    });
+
+                    return {
+                        success: true,
+                        generated: batchResult.generated || 0,
+                        skipped: batchResult.skipped || 0,
+                        errors: batchResult.errors || [],
+                        count: batch.length,
+                    };
+                } catch (err) {
+                    return {
+                        success: false,
+                        generated: 0,
+                        skipped: 0,
+                        errors: [`Batch ${batchIndex + 1}: ${err?.data?.message || err?.message || "Failed"}`],
+                        count: batch.length,
+                    };
+                }
+            }
+
+            // Process batches in parallel with concurrency limit
+            let batchIndex = 0;
+            const runningBatches = new Set();
+
+            while (batchIndex < batches.length || runningBatches.size > 0) {
+                // Start new batches up to the concurrency limit
+                while (runningBatches.size < PARALLEL_BATCHES && batchIndex < batches.length) {
+                    const currentIndex = batchIndex;
+                    const batch = batches[currentIndex];
+                    batchIndex++;
+
+                    const batchPromise = processBatch(batch, currentIndex).then((result) => {
+                        // Update progress
+                        progress.generated += result.generated;
+                        progress.skipped += result.skipped;
+                        progress.completed += result.count;
+                        if (result.errors.length > 0) {
+                            progress.errors = [...progress.errors, ...result.errors].slice(0, 10);
+                        }
+                        progress = progress; // Trigger reactivity
+                        
+                        runningBatches.delete(batchPromise);
+                        return result;
+                    });
+
+                    runningBatches.add(batchPromise);
+                }
+
+                // Wait for at least one batch to complete before continuing
+                if (runningBatches.size > 0) {
+                    await Promise.race(runningBatches);
+                }
+            }
+
+            // Final result
+            result = {
+                generated: progress.generated,
+                skipped: progress.skipped,
+                errors: progress.errors.length > 0 ? progress.errors : undefined,
+            };
+
+            if (progress.generated > 0) {
+                addSuccessToast(`Generated embeddings for ${progress.generated} record${progress.generated !== 1 ? "s" : ""}`);
+                dispatch("generated", result);
+            } else if (progress.skipped > 0) {
+                addSuccessToast(`All ${progress.skipped} records were skipped (empty content)`);
+            }
+
+            // Reload stats after generation
+            loadStats();
+        } catch (err) {
+            ApiClient.error(err);
+            result = { error: err?.data?.message || err?.message || "Failed to generate embeddings" };
+        }
+
+        isGenerating = false;
+    }
+
+    function formatNumber(n) {
+        if (n === null || n === undefined || n === "" || isNaN(n)) return "0";
+        return Number(n).toLocaleString();
+    }
+
+    function getDefaultTemplate() {
+        return textFields.map(f => `{${f.name}}`).join("\n");
+    }
+</script>
+
+<OverlayPanel bind:this={panel} class="embeddings-panel overlay-panel-lg" popup on:hide on:show>
+    <svelte:fragment slot="header">
+        <h4>
+            <i class="ri-bubble-chart-line" aria-hidden="true" />
+            <span class="txt">Generate Vector Embeddings</span>
+        </h4>
+    </svelte:fragment>
+
+    <div class="content">
+        {#if !hasEmbeddableFields && !canEmbedRecords}
+            <div class="alert alert-warning">
+                <i class="ri-error-warning-line" />
+                <div>
+                    <strong>No text fields found</strong>
+                    <p class="txt-sm m-t-5 m-b-0">
+                        This collection has no text or editor fields to embed.
+                    </p>
+                </div>
+            </div>
+        {:else}
+            <p class="txt-hint m-b-base">
+                Generate vector embeddings for
+                <strong>{collection?.name}</strong> to enable similarity search.
+            </p>
+
+            <!-- Mode Selection -->
+            <Field class="form-field m-b-base" name="mode" let:uniqueId>
+                <label for={uniqueId}>
+                    Embedding mode
+                    <i
+                        class="ri-information-line link-hint"
+                        use:tooltip={{
+                            text: "Field: Embed individual text fields separately. Record: Embed the entire record as one combined text.",
+                            position: "top",
+                        }}
+                    />
+                </label>
+                <div class="mode-selector">
+                    <button 
+                        type="button" 
+                        class="mode-btn" 
+                        class:active={embeddingMode === "field"}
+                        disabled={isGenerating || !hasEmbeddableFields}
+                        on:click={() => embeddingMode = "field"}
+                    >
+                        <i class="ri-text-spacing" />
+                        <span>Field-level</span>
+                    </button>
+                    <button 
+                        type="button" 
+                        class="mode-btn" 
+                        class:active={embeddingMode === "record"}
+                        disabled={isGenerating || !canEmbedRecords}
+                        on:click={() => embeddingMode = "record"}
+                    >
+                        <i class="ri-file-list-3-line" />
+                        <span>Entire record</span>
+                    </button>
+                </div>
+            </Field>
+
+            {#if embeddingMode === "field"}
+                <!-- Field Selection -->
+                {#if hasEmbeddableFields}
+                    <Field class="form-field m-b-base" name="field" let:uniqueId>
+                        <label for={uniqueId}>
+                            Select field
+                            <i
+                                class="ri-information-line link-hint"
+                                use:tooltip={{
+                                    text: "Choose which embeddable text field to generate embeddings for",
+                                    position: "top",
+                                }}
+                            />
+                        </label>
+                        <select id={uniqueId} bind:value={selectedField} disabled={isGenerating}>
+                            {#each embeddableFields as field}
+                                <option value={field.name}>{field.name}</option>
+                            {/each}
+                        </select>
+                    </Field>
+                {:else}
+                    <div class="alert alert-warning m-b-base">
+                        <i class="ri-error-warning-line" />
+                        <div>
+                            <strong>No embeddable fields</strong>
+                            <p class="txt-sm m-t-5 m-b-0">
+                                Enable "Vector embeddings" on text fields in the schema, or use "Entire record" mode.
+                            </p>
+                        </div>
+                    </div>
+                {/if}
+            {:else}
+                <!-- Record-level options -->
+                <div class="record-mode-info m-b-base">
+                    <p class="txt-hint txt-sm m-b-sm">
+                        <i class="ri-information-line" />
+                        All text fields will be combined into a single embedding per record.
+                    </p>
+                    <p class="txt-hint txt-sm">
+                        <strong>Fields included:</strong> {textFields.map(f => f.name).join(", ")}
+                    </p>
+                </div>
+
+                <!-- Optional custom template -->
+                <Field class="form-field m-b-base" name="template" let:uniqueId>
+                    <label for={uniqueId}>
+                        Custom template (optional)
+                        <i
+                            class="ri-information-line link-hint"
+                            use:tooltip={{
+                                text: "Use {fieldName} placeholders. Leave empty for default format.",
+                                position: "top",
+                            }}
+                        />
+                    </label>
+                    <textarea
+                        id={uniqueId}
+                        bind:value={customTemplate}
+                        placeholder={getDefaultTemplate()}
+                        rows="3"
+                        disabled={isGenerating}
+                    />
+                </Field>
+            {/if}
+
+            <!-- Stats -->
+            {#if stats}
+                <div class="stats-section m-b-base" transition:slide={{ duration: 150 }}>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <div class="stat-value">{formatNumber(stats.totalRecords)}</div>
+                            <div class="stat-label">Total Records</div>
+                        </div>
+                        <div class="stat-item embedded">
+                            <div class="stat-value">{formatNumber(stats.embeddedRecords)}</div>
+                            <div class="stat-label">With Embeddings</div>
+                        </div>
+                        <div class="stat-item pending">
+                            <div class="stat-value">{formatNumber(stats.notEmbeddedRecords)}</div>
+                            <div class="stat-label">Pending</div>
+                        </div>
+                    </div>
+                    
+                    {#if stats.embeddedRecords > 0}
+                        <div class="progress-bar m-t-sm">
+                            <div 
+                                class="progress-fill" 
+                                style="width: {(stats.embeddedRecords / stats.totalRecords) * 100}%"
+                            />
+                        </div>
+                        <p class="txt-hint txt-sm txt-center m-t-5">
+                            {Math.round((stats.embeddedRecords / stats.totalRecords) * 100)}% complete
+                        </p>
+                    {/if}
+                </div>
+            {:else if isLoadingStats}
+                <div class="stats-loading m-b-base">
+                    <i class="ri-loader-4-line" />
+                    Loading stats...
+                </div>
+            {/if}
+
+            <!-- Info -->
+            {#if !isGenerating}
+                <div class="info-section m-b-base">
+                    <p class="txt-hint txt-sm">
+                        <i class="ri-information-line" />
+                        Embeddings are generated using OpenAI's embedding model. Records with existing embeddings will be updated.
+                    </p>
+                </div>
+            {/if}
+
+            <!-- Progress during generation -->
+            {#if isGenerating && progress}
+                <div class="generation-progress m-b-base" transition:slide={{ duration: 150 }}>
+                    <div class="progress-header">
+                        <span class="progress-title">
+                            <i class="ri-loader-4-line spinning" />
+                            Generating embeddings...
+                        </span>
+                        <span class="progress-count">
+                            {formatNumber(progress.completed)} / {formatNumber(progress.total)}
+                        </span>
+                    </div>
+                    <div class="progress-bar">
+                        <div 
+                            class="progress-fill active" 
+                            style="width: {(progress.completed / progress.total) * 100}%"
+                        />
+                    </div>
+                    <div class="progress-details">
+                        <span class="txt-success">
+                            <i class="ri-check-line" /> {formatNumber(progress.generated)} generated
+                        </span>
+                        {#if progress.skipped > 0}
+                            <span class="txt-hint">
+                                <i class="ri-skip-forward-line" /> {formatNumber(progress.skipped)} skipped
+                            </span>
+                        {/if}
+                        {#if progress.errors.length > 0}
+                            <span class="txt-danger">
+                                <i class="ri-error-warning-line" /> {progress.errors.length} error{progress.errors.length !== 1 ? "s" : ""}
+                            </span>
+                        {/if}
+                    </div>
+                </div>
+            {/if}
+
+            {#if result}
+                <div class="result m-t-base" transition:slide={{ duration: 150 }}>
+                    {#if result.error}
+                        <div class="alert alert-danger">
+                            <i class="ri-error-warning-line" />
+                            {result.error}
+                        </div>
+                    {:else}
+                        <div class="alert alert-success">
+                            <i class="ri-check-line" />
+                            <div class="result-content">
+                                <strong>{formatNumber(result.generated)}</strong> embedding{result.generated !== 1 ? "s" : ""} generated
+                                {#if result.skipped > 0}
+                                    <span class="txt-hint">
+                                        ({formatNumber(result.skipped)} skipped - empty or already embedded)
+                                    </span>
+                                {/if}
+                            </div>
+                        </div>
+                        {#if result.errors && result.errors.length > 0}
+                            <div class="error-details m-t-sm">
+                                <p class="txt-hint txt-sm m-b-5">Errors:</p>
+                                <ul class="txt-sm">
+                                    {#each result.errors as error}
+                                        <li class="txt-danger">{error}</li>
+                                    {/each}
+                                </ul>
+                            </div>
+                        {/if}
+                    {/if}
+                </div>
+            {/if}
+        {/if}
+    </div>
+
+    <svelte:fragment slot="footer">
+        <button type="button" class="btn btn-transparent" disabled={isGenerating} on:click={() => hide()}>
+            <span class="txt">Close</span>
+        </button>
+        {#if (embeddingMode === "field" && hasEmbeddableFields) || (embeddingMode === "record" && canEmbedRecords)}
+            <button
+                type="button"
+                class="btn btn-expanded"
+                class:btn-loading={isGenerating}
+                disabled={isGenerating || (embeddingMode === "field" && !selectedField)}
+                on:click={() => generateEmbeddings()}
+            >
+                <i class="ri-bubble-chart-line" aria-hidden="true" />
+                <span class="txt">
+                    {#if stats?.notEmbeddedRecords > 0}
+                        Generate {formatNumber(stats.notEmbeddedRecords)} Embedding{stats.notEmbeddedRecords !== 1 ? "s" : ""}
+                    {:else}
+                        Generate Embeddings
+                    {/if}
+                </span>
+            </button>
+        {/if}
+    </svelte:fragment>
+</OverlayPanel>
+
+<style>
+    h4 {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    h4 i {
+        font-size: 1.2em;
+        color: var(--primaryColor);
+    }
+
+    /* Stats section */
+    .stats-section {
+        background: var(--baseAlt1Color);
+        border-radius: var(--baseRadius);
+        padding: 16px;
+    }
+
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+    }
+
+    .stat-item {
+        text-align: center;
+        padding: 8px;
+        background: var(--baseColor);
+        border-radius: var(--baseRadius);
+    }
+
+    .stat-value {
+        font-size: 1.5em;
+        font-weight: 700;
+        color: var(--txtPrimaryColor);
+    }
+
+    .stat-label {
+        font-size: 0.75em;
+        color: var(--txtHintColor);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .stat-item.embedded .stat-value {
+        color: var(--successColor);
+    }
+
+    .stat-item.pending .stat-value {
+        color: var(--warningColor);
+    }
+
+    .progress-bar {
+        height: 6px;
+        background: var(--baseAlt2Color);
+        border-radius: 3px;
+        overflow: hidden;
+    }
+
+    .progress-fill {
+        height: 100%;
+        background: var(--successColor);
+        transition: width 0.3s ease;
+    }
+
+    .progress-fill.active {
+        background: linear-gradient(
+            90deg,
+            var(--primaryColor) 0%,
+            var(--successColor) 100%
+        );
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
+    }
+
+    /* Generation progress */
+    .generation-progress {
+        background: var(--baseAlt1Color);
+        border-radius: var(--baseRadius);
+        padding: 16px;
+        border: 1px solid var(--primaryColor);
+    }
+
+    .progress-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 12px;
+    }
+
+    .progress-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+        color: var(--primaryColor);
+    }
+
+    .progress-count {
+        font-family: monospace;
+        color: var(--txtHintColor);
+    }
+
+    .progress-details {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        margin-top: 12px;
+        font-size: 0.85em;
+    }
+
+    .progress-details span {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+
+    .spinning {
+        animation: spin 1s linear infinite;
+    }
+
+    .stats-loading {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 20px;
+        color: var(--txtHintColor);
+    }
+
+    .stats-loading i {
+        animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+    }
+
+    /* Info section */
+    .info-section {
+        background: var(--infoAltColor);
+        padding: 12px;
+        border-radius: var(--baseRadius);
+    }
+
+    .info-section p {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        margin: 0;
+    }
+
+    .info-section i {
+        flex-shrink: 0;
+        margin-top: 2px;
+    }
+
+    /* Alerts */
+    .alert {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+    }
+
+    .alert i {
+        font-size: 1.1em;
+        flex-shrink: 0;
+        margin-top: 2px;
+    }
+
+    .alert-warning {
+        background: var(--warningAltColor);
+        color: var(--txtPrimaryColor);
+        padding: 12px;
+        border-radius: var(--baseRadius);
+    }
+
+    .alert-warning strong {
+        color: var(--warningColor);
+    }
+
+    .result-content {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .error-details ul {
+        margin: 0;
+        padding-left: 20px;
+    }
+
+    /* Mode selector */
+    .mode-selector {
+        display: flex;
+        gap: 8px;
+    }
+
+    .mode-btn {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 12px 16px;
+        border: 2px solid var(--baseAlt2Color);
+        border-radius: var(--baseRadius);
+        background: var(--baseColor);
+        color: var(--txtHintColor);
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .mode-btn:hover:not(:disabled) {
+        border-color: var(--primaryColor);
+        color: var(--txtPrimaryColor);
+    }
+
+    .mode-btn.active {
+        border-color: var(--primaryColor);
+        background: var(--primaryAltColor);
+        color: var(--primaryColor);
+    }
+
+    .mode-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    .mode-btn i {
+        font-size: 1.2em;
+    }
+
+    /* Record mode info */
+    .record-mode-info {
+        background: var(--baseAlt1Color);
+        border-radius: var(--baseRadius);
+        padding: 12px;
+    }
+
+    .record-mode-info p {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+        margin: 0;
+    }
+
+    .record-mode-info i {
+        flex-shrink: 0;
+        margin-top: 2px;
+    }
+
+    textarea {
+        resize: vertical;
+        min-height: 60px;
+        font-family: monospace;
+        font-size: 0.9em;
+    }
+</style>
+

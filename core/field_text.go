@@ -107,6 +107,11 @@ type TextField struct {
 	//
 	// A single collection can have only 1 field marked as primary key.
 	PrimaryKey bool `form:"primaryKey" json:"primaryKey"`
+
+	// Embeddable marks this text field as eligible for vector embedding generation.
+	// When enabled, users can generate vector embeddings for this field's content
+	// which are stored in a separate _embeddings collection for similarity search.
+	Embeddable bool `form:"embeddable" json:"embeddable"`
 }
 
 // Type implements [Field.Type] interface method.

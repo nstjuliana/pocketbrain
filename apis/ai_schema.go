@@ -17,6 +17,12 @@ func bindAIApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	subGroup.POST("/generate-schema", aiGenerateSchema)
 	subGroup.POST("/test-connection", aiTestConnection)
 	subGroup.POST("/generate-seed-data", aiGenerateSeedData)
+	subGroup.POST("/generate-embeddings", aiGenerateEmbeddings)
+	subGroup.POST("/find-similar", aiFindSimilar)
+	subGroup.GET("/embedding-stats", aiGetEmbeddingStats)
+	subGroup.GET("/embedding-cache-stats", aiGetEmbeddingCacheStats)
+	subGroup.POST("/clear-embedding-cache", aiClearEmbeddingCache)
+	subGroup.GET("/pending-embeddings", aiGetPendingEmbeddings)
 }
 
 func aiGenerateSchema(e *core.RequestEvent) error {
@@ -194,5 +200,124 @@ func aiGenerateSeedData(e *core.RequestEvent) error {
 	}
 
 	return e.JSON(http.StatusOK, response)
+}
+
+// aiGenerateEmbeddings generates vector embeddings for records in a collection.
+func aiGenerateEmbeddings(e *core.RequestEvent) error {
+	var req core.EmbeddingRequest
+
+	if err := e.BindBody(&req); err != nil {
+		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
+	}
+
+	// Validate request - CollectionId is always required
+	// FieldName is only required for field-level mode (not record mode)
+	if req.CollectionId == "" {
+		return e.BadRequestError("collectionId is required.", nil)
+	}
+
+	// For field mode (default), fieldName is required
+	if req.Mode != core.EmbeddingModeRecord && req.FieldName == "" {
+		return e.BadRequestError("fieldName is required for field-level embedding mode.", nil)
+	}
+
+	// Generate embeddings
+	response, err := core.GenerateEmbeddings(e.App, req)
+	if err != nil {
+		return e.BadRequestError("Failed to generate embeddings: "+err.Error(), nil)
+	}
+
+	return e.JSON(http.StatusOK, response)
+}
+
+// aiFindSimilar finds records similar to a given text or record.
+func aiFindSimilar(e *core.RequestEvent) error {
+	var req core.FindSimilarRequest
+
+	if err := e.BindBody(&req); err != nil {
+		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
+	}
+
+	// Validate request - CollectionId is always required
+	if req.CollectionId == "" {
+		return e.BadRequestError("collectionId is required.", nil)
+	}
+
+	// For field mode (default), fieldName is required
+	if req.Mode != core.EmbeddingModeRecord && req.FieldName == "" {
+		return e.BadRequestError("fieldName is required for field-level search mode.", nil)
+	}
+
+	// Validate limit
+	if req.Limit < 0 || req.Limit > 100 {
+		return e.BadRequestError("limit must be between 1 and 100.", nil)
+	}
+
+	// Require either text or recordId
+	if req.Text == "" && req.RecordId == "" {
+		return e.BadRequestError("Either 'text' or 'recordId' must be provided.", nil)
+	}
+
+	// Set default limit
+	if req.Limit == 0 {
+		req.Limit = 10
+	}
+
+	// Find similar records
+	response, err := core.FindSimilarRecords(e.App, req)
+	if err != nil {
+		return e.BadRequestError("Failed to find similar records: "+err.Error(), nil)
+	}
+
+	return e.JSON(http.StatusOK, response)
+}
+
+// aiGetEmbeddingStats returns embedding statistics for a collection/field.
+func aiGetEmbeddingStats(e *core.RequestEvent) error {
+	collectionId := e.Request.URL.Query().Get("collectionId")
+	fieldName := e.Request.URL.Query().Get("fieldName")
+
+	if collectionId == "" || fieldName == "" {
+		return e.BadRequestError("Both 'collectionId' and 'fieldName' query parameters are required.", nil)
+	}
+
+	stats, err := core.GetEmbeddingStatsForField(e.App, collectionId, fieldName)
+	if err != nil {
+		return e.BadRequestError("Failed to get embedding stats: "+err.Error(), nil)
+	}
+
+	return e.JSON(http.StatusOK, stats)
+}
+
+// aiGetEmbeddingCacheStats returns statistics about the embedding cache.
+func aiGetEmbeddingCacheStats(e *core.RequestEvent) error {
+	stats := core.GetEmbeddingCacheStats()
+	return e.JSON(http.StatusOK, stats)
+}
+
+// aiClearEmbeddingCache clears the embedding cache.
+func aiClearEmbeddingCache(e *core.RequestEvent) error {
+	core.ClearEmbeddingCache()
+	return e.JSON(http.StatusOK, map[string]string{"status": "ok", "message": "Embedding cache cleared"})
+}
+
+// aiGetPendingEmbeddings returns record IDs that need embeddings.
+func aiGetPendingEmbeddings(e *core.RequestEvent) error {
+	collectionId := e.Request.URL.Query().Get("collectionId")
+	fieldName := e.Request.URL.Query().Get("fieldName")
+
+	if collectionId == "" || fieldName == "" {
+		return e.BadRequestError("Both 'collectionId' and 'fieldName' query parameters are required.", nil)
+	}
+
+	recordIds, err := core.GetPendingEmbeddingRecordIds(e.App, collectionId, fieldName)
+	if err != nil {
+		return e.BadRequestError("Failed to get pending embeddings: "+err.Error(), nil)
+	}
+
+	return e.JSON(http.StatusOK, map[string]any{
+		"recordIds": recordIds,
+		"count":     len(recordIds),
+	})
 }
 

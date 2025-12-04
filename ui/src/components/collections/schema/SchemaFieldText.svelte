@@ -89,4 +89,21 @@
             </div>
         </div>
     </svelte:fragment>
+
+    <svelte:fragment slot="optionsFooter">
+        {#if !field.primaryKey}
+            <Field class="form-field form-field-toggle" name="fields.{key}.embeddable" let:uniqueId>
+                <input type="checkbox" id={uniqueId} bind:checked={field.embeddable} />
+                <label for={uniqueId}>
+                    <span class="txt">Enable vector embeddings</span>
+                    <i
+                        class="ri-information-line link-hint"
+                        use:tooltip={{
+                            text: `When enabled, you can generate vector embeddings for this field's content to enable similarity search and related content queries. Requires AI to be configured in Settings.`,
+                        }}
+                    />
+                </label>
+            </Field>
+        {/if}
+    </svelte:fragment>
 </SchemaField>

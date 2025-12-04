@@ -625,8 +625,9 @@
         {/if}
 
         <!-- AI Assistant tab (only for non-view collections) -->
-        {#if !isView && activeTab === TAB_AI}
-            <div class="tab-item active ai-tab-content">
+        <!-- Keep mounted to preserve chat state, use CSS to hide -->
+        {#if !isView}
+            <div class="tab-item ai-tab-content" class:active={activeTab === TAB_AI} class:hidden={activeTab !== TAB_AI}>
                 <SchemaChat bind:collection on:applied={() => changeTab(TAB_FIELDS)} />
             </div>
         {/if}
@@ -969,5 +970,10 @@
     :global(.btn-success:hover:not(:disabled)) {
         background: #059669 !important;
         border-color: #059669 !important;
+    }
+
+    /* Keep AI tab mounted but hidden to preserve state */
+    .tab-item.hidden {
+        display: none !important;
     }
 </style>
