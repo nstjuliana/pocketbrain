@@ -17,11 +17,25 @@
 
     // Ensure ai object exists with all required properties (only once)
     if (!formSettings.ai) {
-        formSettings.ai = { enabled: false, provider: "openai", model: "gpt-4o-mini", apiKey: "" };
+        formSettings.ai = { 
+            enabled: false, 
+            provider: "openai", 
+            model: "gpt-4o-mini", 
+            apiKey: "",
+            embeddingModel: "text-embedding-3-small",
+            embeddingDimensions: 1536
+        };
     }
     // Ensure apiKey is always a string (not undefined) for binding to work
     if (formSettings.ai && (formSettings.ai.apiKey === undefined || formSettings.ai.apiKey === null)) {
         formSettings.ai.apiKey = "";
+    }
+    // Ensure embedding settings have defaults
+    if (formSettings.ai && !formSettings.ai.embeddingModel) {
+        formSettings.ai.embeddingModel = "text-embedding-3-small";
+    }
+    if (formSettings.ai && !formSettings.ai.embeddingDimensions) {
+        formSettings.ai.embeddingDimensions = 1536;
     }
     
     // Determine if there's a saved API key by checking if AI was enabled in the original settings
@@ -76,6 +90,20 @@
         { value: "gpt-4-turbo", label: "GPT-4 Turbo" },
         { value: "gpt-3.5-turbo", label: "GPT-3.5 Turbo" },
     ];
+
+    const embeddingModels = [
+        { value: "text-embedding-3-small", label: "text-embedding-3-small (1536 dims)", dimensions: 1536 },
+        { value: "text-embedding-3-large", label: "text-embedding-3-large (3072 dims)", dimensions: 3072 },
+        { value: "text-embedding-ada-002", label: "text-embedding-ada-002 (1536 dims)", dimensions: 1536 },
+    ];
+
+    // Update dimensions when embedding model changes
+    function onEmbeddingModelChange() {
+        const selected = embeddingModels.find(m => m.value === formSettings.ai.embeddingModel);
+        if (selected) {
+            formSettings.ai.embeddingDimensions = selected.dimensions;
+        }
+    }
 </script>
 
 <Accordion single>
@@ -120,12 +148,40 @@
 
             <div class="col-lg-6">
                 <Field class="form-field required" name="ai.model" let:uniqueId>
-                    <label for={uniqueId}>Model</label>
+                    <label for={uniqueId}>Chat Model</label>
                     <select id={uniqueId} required bind:value={formSettings.ai.model}>
                         {#each models as model}
                             <option value={model.value}>{model.label}</option>
                         {/each}
                     </select>
+                    <div class="help-block">Model used for schema generation and seed data.</div>
+                </Field>
+            </div>
+
+            <div class="col-lg-6">
+                <Field class="form-field required" name="ai.embeddingModel" let:uniqueId>
+                    <label for={uniqueId}>Embedding Model</label>
+                    <select id={uniqueId} required bind:value={formSettings.ai.embeddingModel} on:change={onEmbeddingModelChange}>
+                        {#each embeddingModels as model}
+                            <option value={model.value}>{model.label}</option>
+                        {/each}
+                    </select>
+                    <div class="help-block">Model used for generating vector embeddings.</div>
+                </Field>
+            </div>
+
+            <div class="col-lg-6">
+                <Field class="form-field required" name="ai.embeddingDimensions" let:uniqueId>
+                    <label for={uniqueId}>Embedding Dimensions</label>
+                    <input 
+                        type="number" 
+                        id={uniqueId} 
+                        required 
+                        min="1" 
+                        max="4096"
+                        bind:value={formSettings.ai.embeddingDimensions} 
+                    />
+                    <div class="help-block">Vector dimensions (auto-set by model selection).</div>
                 </Field>
             </div>
 

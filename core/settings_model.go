@@ -180,9 +180,11 @@ func newDefaultSettings() *Settings {
 				},
 			},
 			AI: AIConfig{
-				Enabled: false,
-				Provider: "openai",
-				Model:   "gpt-4o-mini",
+				Enabled:             false,
+				Provider:            "openai",
+				Model:               "gpt-4o-mini",
+				EmbeddingModel:      "text-embedding-3-small",
+				EmbeddingDimensions: 1536,
 			},
 		},
 	}
@@ -726,10 +728,12 @@ func (c RateLimitRule) String() string {
 // -------------------------------------------------------------------
 
 type AIConfig struct {
-	Enabled  bool   `form:"enabled" json:"enabled"`
-	Provider string `form:"provider" json:"provider"`
-	APIKey   string `form:"apiKey" json:"apiKey,omitempty"`
-	Model    string `form:"model" json:"model"`
+	Enabled             bool   `form:"enabled" json:"enabled"`
+	Provider            string `form:"provider" json:"provider"`
+	APIKey              string `form:"apiKey" json:"apiKey,omitempty"`
+	Model               string `form:"model" json:"model"`
+	EmbeddingModel      string `form:"embeddingModel" json:"embeddingModel"`
+	EmbeddingDimensions int    `form:"embeddingDimensions" json:"embeddingDimensions"`
 }
 
 // Validate makes AIConfig validatable by implementing [validation.Validatable] interface.
@@ -747,6 +751,14 @@ func (c AIConfig) Validate() error {
 		validation.Field(
 			&c.Model,
 			validation.When(c.Enabled, validation.Required),
+		),
+		validation.Field(
+			&c.EmbeddingModel,
+			validation.When(c.Enabled, validation.Required),
+		),
+		validation.Field(
+			&c.EmbeddingDimensions,
+			validation.When(c.Enabled, validation.Required, validation.Min(1), validation.Max(4096)),
 		),
 	)
 }

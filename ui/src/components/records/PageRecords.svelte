@@ -14,6 +14,8 @@
     import RecordsCount from "@/components/records/RecordsCount.svelte";
     import RecordsList from "@/components/records/RecordsList.svelte";
     import SeedDataPanel from "@/components/records/SeedDataPanel.svelte";
+    import EmbeddingsPanel from "@/components/records/EmbeddingsPanel.svelte";
+    import SimilaritySearchPanel from "@/components/records/SimilaritySearchPanel.svelte";
     import { hideControls, pageTitle } from "@/stores/app";
     import {
         activeCollection,
@@ -32,7 +34,14 @@
     let recordsList;
     let recordsCount;
     let seedDataPanel;
+    let embeddingsPanel;
+    let similaritySearchPanel;
     let filter = initialQueryParams.get("filter") || "";
+
+    // Check if collection has any embeddable fields (text or editor)
+    $: hasEmbeddableFields = ($activeCollection?.fields || []).some(
+        (f) => (f.type === "text" || f.type === "editor") && f.embeddable
+    );
     let sort = initialQueryParams.get("sort") || "-@rowid";
     let selectedCollectionIdOrName = initialQueryParams.get("collection") || $activeCollection?.id;
     let totalCount = 0; // used to manully change the count without the need of reloading the recordsCount component
@@ -221,6 +230,27 @@
                         <span class="txt">Generate Data</span>
                     </button>
 
+                    {#if hasEmbeddableFields}
+                        <button
+                            type="button"
+                            class="btn btn-outline"
+                            use:tooltip={{ text: "Generate vector embeddings for similarity search", position: "bottom" }}
+                            on:click={() => embeddingsPanel?.show()}
+                        >
+                            <i class="ri-bubble-chart-line" />
+                            <span class="txt">Embeddings</span>
+                        </button>
+                        <button
+                            type="button"
+                            class="btn btn-outline"
+                            use:tooltip={{ text: "Search for similar records using vector similarity", position: "bottom" }}
+                            on:click={() => similaritySearchPanel?.show()}
+                        >
+                            <i class="ri-search-eye-line" />
+                            <span class="txt">Similar</span>
+                        </button>
+                    {/if}
+
                     <button type="button" class="btn btn-expanded" on:click={() => recordUpsertPanel?.show()}>
                         <i class="ri-add-line" />
                         <span class="txt">New record</span>
@@ -322,4 +352,14 @@
         recordsList?.load();
         recordsCount?.reload();
     }}
+/>
+
+<EmbeddingsPanel
+    bind:this={embeddingsPanel}
+    collection={$activeCollection}
+/>
+
+<SimilaritySearchPanel
+    bind:this={similaritySearchPanel}
+    collection={$activeCollection}
 />

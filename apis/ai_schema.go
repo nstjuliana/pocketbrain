@@ -17,6 +17,9 @@ func bindAIApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	subGroup.POST("/generate-schema", aiGenerateSchema)
 	subGroup.POST("/test-connection", aiTestConnection)
 	subGroup.POST("/generate-seed-data", aiGenerateSeedData)
+	subGroup.POST("/generate-embeddings", aiGenerateEmbeddings)
+	subGroup.POST("/find-similar", aiFindSimilar)
+	subGroup.GET("/embedding-stats", aiGetEmbeddingStats)
 }
 
 func aiGenerateSchema(e *core.RequestEvent) error {
@@ -194,5 +197,83 @@ func aiGenerateSeedData(e *core.RequestEvent) error {
 	}
 
 	return e.JSON(http.StatusOK, response)
+}
+
+// aiGenerateEmbeddings generates vector embeddings for records in a collection.
+func aiGenerateEmbeddings(e *core.RequestEvent) error {
+	var req core.EmbeddingRequest
+
+	if err := e.BindBody(&req); err != nil {
+		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
+	}
+
+	// Validate request
+	if err := validation.ValidateStruct(&req,
+		validation.Field(&req.CollectionId, validation.Required),
+		validation.Field(&req.FieldName, validation.Required),
+	); err != nil {
+		return e.BadRequestError("Invalid request data.", err)
+	}
+
+	// Generate embeddings
+	response, err := core.GenerateEmbeddings(e.App, req)
+	if err != nil {
+		return e.BadRequestError("Failed to generate embeddings: "+err.Error(), nil)
+	}
+
+	return e.JSON(http.StatusOK, response)
+}
+
+// aiFindSimilar finds records similar to a given text or record.
+func aiFindSimilar(e *core.RequestEvent) error {
+	var req core.FindSimilarRequest
+
+	if err := e.BindBody(&req); err != nil {
+		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
+	}
+
+	// Validate request
+	if err := validation.ValidateStruct(&req,
+		validation.Field(&req.CollectionId, validation.Required),
+		validation.Field(&req.FieldName, validation.Required),
+		validation.Field(&req.Limit, validation.Min(1), validation.Max(100)),
+	); err != nil {
+		return e.BadRequestError("Invalid request data.", err)
+	}
+
+	// Require either text or recordId
+	if req.Text == "" && req.RecordId == "" {
+		return e.BadRequestError("Either 'text' or 'recordId' must be provided.", nil)
+	}
+
+	// Set default limit
+	if req.Limit == 0 {
+		req.Limit = 10
+	}
+
+	// Find similar records
+	response, err := core.FindSimilarRecords(e.App, req)
+	if err != nil {
+		return e.BadRequestError("Failed to find similar records: "+err.Error(), nil)
+	}
+
+	return e.JSON(http.StatusOK, response)
+}
+
+// aiGetEmbeddingStats returns embedding statistics for a collection/field.
+func aiGetEmbeddingStats(e *core.RequestEvent) error {
+	collectionId := e.Request.URL.Query().Get("collectionId")
+	fieldName := e.Request.URL.Query().Get("fieldName")
+
+	if collectionId == "" || fieldName == "" {
+		return e.BadRequestError("Both 'collectionId' and 'fieldName' query parameters are required.", nil)
+	}
+
+	stats, err := core.GetEmbeddingStatsForField(e.App, collectionId, fieldName)
+	if err != nil {
+		return e.BadRequestError("Failed to get embedding stats: "+err.Error(), nil)
+	}
+
+	return e.JSON(http.StatusOK, stats)
 }
 
