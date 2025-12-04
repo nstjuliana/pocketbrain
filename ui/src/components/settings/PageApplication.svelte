@@ -11,6 +11,7 @@
     import BatchAccordion from "@/components/settings/BatchAccordion.svelte";
     import TrustedProxyAccordion from "@/components/settings/TrustedProxyAccordion.svelte";
     import RateLimitAccordion from "@/components/settings/RateLimitAccordion.svelte";
+    import AISettingsAccordion from "@/components/settings/AISettingsAccordion.svelte";
 
     $pageTitle = "Application settings";
 
@@ -84,7 +85,13 @@
             batch: settings.batch || {},
             trustedProxy: settings.trustedProxy || { headers: [] },
             rateLimits: settings.rateLimits || { rules: [] },
+            ai: settings.ai || { enabled: false, provider: "openai", model: "gpt-4o-mini", apiKey: "" },
         };
+        
+        // Ensure apiKey exists even if settings.ai exists but apiKey is missing
+        if (formSettings.ai && (formSettings.ai.apiKey === undefined || formSettings.ai.apiKey === null)) {
+            formSettings.ai.apiKey = "";
+        }
 
         sortRules(formSettings.rateLimits.rules);
 
@@ -207,6 +214,7 @@
                             <TrustedProxyAccordion bind:formSettings {healthData} />
                             <RateLimitAccordion bind:formSettings />
                             <BatchAccordion bind:formSettings />
+                            <AISettingsAccordion bind:formSettings {originalFormSettings} />
                         </div>
                     </div>
                     <div class="col-lg-12">

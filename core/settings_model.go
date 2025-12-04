@@ -128,6 +128,7 @@ type settings struct {
 	TrustedProxy TrustedProxyConfig `form:"trustedProxy" json:"trustedProxy"`
 	Batch        BatchConfig        `form:"batch" json:"batch"`
 	Logs         LogsConfig         `form:"logs" json:"logs"`
+	AI           AIConfig           `form:"ai" json:"ai"`
 }
 
 // Settings defines the PocketBase app settings.
@@ -177,6 +178,11 @@ func newDefaultSettings() *Settings {
 					{Label: "/api/batch", MaxRequests: 3, Duration: 1},
 					{Label: "/api/", MaxRequests: 300, Duration: 10},
 				},
+			},
+			AI: AIConfig{
+				Enabled: false,
+				Provider: "openai",
+				Model:   "gpt-4o-mini",
 			},
 		},
 	}
@@ -287,6 +293,7 @@ func (s *Settings) PostValidate(ctx context.Context, app App) error {
 		validation.Field(&s.Batch),
 		validation.Field(&s.RateLimits),
 		validation.Field(&s.TrustedProxy),
+		validation.Field(&s.AI),
 	)
 }
 
@@ -331,6 +338,7 @@ func (s *Settings) MarshalJSON() ([]byte, error) {
 		&copy.SMTP.Password,
 		&copy.S3.Secret,
 		&copy.Backups.S3.Secret,
+		&copy.AI.APIKey,
 	}
 
 	// mask all sensitive fields
@@ -713,4 +721,32 @@ func (c RateLimitRule) String() string {
 	}
 
 	return string(raw)
+}
+
+// -------------------------------------------------------------------
+
+type AIConfig struct {
+	Enabled  bool   `form:"enabled" json:"enabled"`
+	Provider string `form:"provider" json:"provider"`
+	APIKey   string `form:"apiKey" json:"apiKey,omitempty"`
+	Model    string `form:"model" json:"model"`
+}
+
+// Validate makes AIConfig validatable by implementing [validation.Validatable] interface.
+func (c AIConfig) Validate() error {
+	return validation.ValidateStruct(&c,
+		validation.Field(
+			&c.Provider,
+			validation.When(c.Enabled, validation.Required),
+			validation.In("openai"),
+		),
+		validation.Field(
+			&c.APIKey,
+			validation.When(c.Enabled, validation.Required),
+		),
+		validation.Field(
+			&c.Model,
+			validation.When(c.Enabled, validation.Required),
+		),
+	)
 }

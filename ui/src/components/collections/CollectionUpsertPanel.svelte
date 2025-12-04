@@ -22,6 +22,7 @@
     import CollectionQueryTab from "@/components/collections/CollectionQueryTab.svelte";
     import CollectionRulesTab from "@/components/collections/CollectionRulesTab.svelte";
     import CollectionUpdateConfirm from "@/components/collections/CollectionUpdateConfirm.svelte";
+    import SchemaChat from "@/components/collections/SchemaChat.svelte";
 
     const TAB_SCHEMA = "schema";
     const TAB_RULES = "api_rules";
@@ -49,6 +50,7 @@
     let initialFormHash = calculateFormHash(collection);
     let fieldsTabError = "";
     let baseCollectionKeys = [];
+    let useAISchema = false;
 
     $: baseCollectionKeys = Object.keys($scaffolds["base"] || {});
 
@@ -550,7 +552,38 @@
             {#if isView}
                 <CollectionQueryTab bind:collection />
             {:else}
-                <CollectionFieldsTab bind:collection />
+                <div class="schema-tab-container">
+                    <div class="schema-mode-toggle">
+                        <button
+                            type="button"
+                            class="btn btn-sm"
+                            class:btn-outline={!useAISchema}
+                            class:btn-transparent={useAISchema}
+                            on:click={() => (useAISchema = false)}
+                        >
+                            <i class="ri-edit-line" aria-hidden="true" />
+                            <span class="txt">Manual</span>
+                        </button>
+                        <button
+                            type="button"
+                            class="btn btn-sm"
+                            class:btn-outline={useAISchema}
+                            class:btn-transparent={!useAISchema}
+                            on:click={() => (useAISchema = true)}
+                        >
+                            <i class="ri-robot-line" aria-hidden="true" />
+                            <span class="txt">AI Assistant</span>
+                        </button>
+                    </div>
+
+                    <!-- Keep both mounted to preserve state when switching -->
+                    <div class:hidden={useAISchema}>
+                        <CollectionFieldsTab bind:collection />
+                    </div>
+                    <div class:hidden={!useAISchema}>
+                        <SchemaChat bind:collection on:applied={() => {}} />
+                    </div>
+                </div>
             {/if}
         </div>
 
@@ -624,5 +657,19 @@
     :global(.collection-panel .panel-content) {
         scrollbar-gutter: stable;
         padding-right: calc(var(--baseSpacing) - 5px);
+    }
+
+    .schema-tab-container {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+    }
+
+    .schema-mode-toggle {
+        display: flex;
+        gap: var(--baseSpacing);
+        margin-bottom: var(--baseSpacing);
+        padding-bottom: var(--baseSpacing);
+        border-bottom: 1px solid var(--borderColor);
     }
 </style>

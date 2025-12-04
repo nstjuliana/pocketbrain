@@ -132,6 +132,37 @@ class AppAuthStore extends LocalAuthStore {
 
 const pb = new PocketBase(import.meta.env.PB_BACKEND_URL, new AppAuthStore());
 
+// Initialize AI API methods after pb is created
+pb.ai = {
+    /**
+     * Generate a collection schema using AI
+     * @param {Object} data - Request data with prompt and collectionType
+     * @param {Object} [options] - Request options
+     * @returns {Promise<Object>}
+     */
+    generateSchema: async function (data, options = {}) {
+        return pb.send("/api/ai/generate-schema", {
+            method: "POST",
+            body: data,
+            ...options,
+        });
+    },
+
+    /**
+     * Test AI connection with provided credentials
+     * @param {Object} data - Credentials with provider, model, apiKey
+     * @param {Object} [options] - Request options
+     * @returns {Promise<Object>}
+     */
+    testConnection: async function (data, options = {}) {
+        return pb.send("/api/ai/test-connection", {
+            method: "POST",
+            body: data,
+            ...options,
+        });
+    },
+};
+
 if (pb.authStore.isValid) {
     pb.collection(pb.authStore.record.collectionName || "_superusers")
         .authRefresh()
