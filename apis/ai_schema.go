@@ -91,6 +91,8 @@ func aiTestConnection(e *core.RequestEvent) error {
 }
 
 // aiGenerateSeedData generates sample records for a collection using AI.
+// For counts <= 20: Uses pure AI generation
+// For counts > 20: Uses hybrid AI archetypes + gofakeit multiplexing for speed
 func aiGenerateSeedData(e *core.RequestEvent) error {
 	var req struct {
 		CollectionId string `json:"collectionId"`
@@ -102,10 +104,10 @@ func aiGenerateSeedData(e *core.RequestEvent) error {
 		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
 	}
 
-	// Validate request
+	// Validate request - now supports up to 10,000 records
 	if err := validation.ValidateStruct(&req,
 		validation.Field(&req.CollectionId, validation.Required),
-		validation.Field(&req.Count, validation.Required, validation.Min(1), validation.Max(50)),
+		validation.Field(&req.Count, validation.Required, validation.Min(1), validation.Max(10000)),
 	); err != nil {
 		return e.BadRequestError("Invalid request data.", err)
 	}
@@ -121,42 +123,74 @@ func aiGenerateSeedData(e *core.RequestEvent) error {
 		return e.BadRequestError("Cannot generate seed data for view collections.", nil)
 	}
 
-	// Generate seed data using AI service
-	records, err := core.GenerateSeedDataFromSchema(e.App, collection, req.Count, req.Description)
+	// Generate seed data using hybrid AI service (auto-switches based on count)
+	records, err := core.GenerateSeedDataHybrid(e.App, collection, req.Count, req.Description)
 	if err != nil {
 		return e.BadRequestError("Failed to generate seed data: "+err.Error(), nil)
 	}
 
-	// Create the records in the database
+	// Determine which mode was used
+	mode := "pure_ai"
+	if req.Count > core.HybridThreshold {
+		mode = "hybrid"
+	}
+
+	// Create the records in the database using transaction for better performance
 	created := 0
 	skipped := 0
 	var creationErrors []string
 
-	for i, recordData := range records {
-		record := core.NewRecord(collection)
-		form := forms.NewRecordUpsert(e.App, record)
-		form.GrantSuperuserAccess()
-		form.Load(recordData)
+	// Use batched transaction for large counts
+	batchSize := 100
+	if req.Count > 1000 {
+		batchSize = 500
+	}
 
-		if err := form.Submit(); err != nil {
-			skipped++
-			creationErrors = append(creationErrors,
-				fmt.Sprintf("Record %d: %s", i+1, err.Error()))
-			continue
+	for i := 0; i < len(records); i += batchSize {
+		end := i + batchSize
+		if end > len(records) {
+			end = len(records)
 		}
-		created++
+		batch := records[i:end]
+
+		err := e.App.RunInTransaction(func(txApp core.App) error {
+			for j, recordData := range batch {
+				record := core.NewRecord(collection)
+				form := forms.NewRecordUpsert(txApp, record)
+				form.GrantSuperuserAccess()
+				form.Load(recordData)
+
+				if err := form.Submit(); err != nil {
+					skipped++
+					if len(creationErrors) < 10 {
+						creationErrors = append(creationErrors,
+							fmt.Sprintf("Record %d: %s", i+j+1, err.Error()))
+					}
+					continue
+				}
+				created++
+			}
+			return nil
+		})
+
+		if err != nil {
+			// Log transaction error but continue with other batches
+			creationErrors = append(creationErrors,
+				fmt.Sprintf("Batch %d-%d transaction error: %s", i+1, end, err.Error()))
+		}
 	}
 
 	response := map[string]interface{}{
 		"created": created,
 		"skipped": skipped,
 		"total":   len(records),
+		"mode":    mode,
 	}
 
 	if len(creationErrors) > 0 && len(creationErrors) <= 5 {
 		response["errors"] = creationErrors
 	} else if len(creationErrors) > 5 {
-		response["errors"] = append(creationErrors[:5], "... and more")
+		response["errors"] = append(creationErrors[:5], fmt.Sprintf("... and %d more", len(creationErrors)-5))
 	}
 
 	return e.JSON(http.StatusOK, response)

@@ -11,11 +11,37 @@
 
     export let collection;
 
+    // Hybrid threshold - matches backend constant
+    const HYBRID_THRESHOLD = 20;
+    const MAX_COUNT = 10000;
+
     let panel;
-    let count = 10;
+    let count = 50;
     let description = "";
     let isGenerating = false;
     let result = null;
+
+    // Quick presets for count selection
+    const countPresets = [10, 50, 100, 500, 1000, 5000, 10000];
+
+    // Determine if fast mode (hybrid) will be used
+    $: isFastMode = count > HYBRID_THRESHOLD;
+
+    // Estimated time based on count and mode
+    $: estimatedTime = getEstimatedTime(count);
+
+    function getEstimatedTime(n) {
+        if (n <= HYBRID_THRESHOLD) {
+            // Pure AI mode: ~2-5 seconds
+            return `~${Math.max(2, Math.ceil(n / 5))}s (AI)`;
+        } else {
+            // Hybrid mode: much faster
+            if (n <= 100) return "~2-3s";
+            if (n <= 1000) return "~3-5s";
+            if (n <= 5000) return "~5-8s";
+            return "~8-15s";
+        }
+    }
 
     // Fields that will be generated (for display)
     $: generatableFields = (collection?.fields || []).filter((f) => {
@@ -55,7 +81,7 @@
 
     export function show() {
         result = null;
-        count = 10;
+        count = 50;
         description = "";
         return panel?.show();
     }
@@ -97,6 +123,14 @@
             generateSeedData();
         }
     }
+
+    function setCount(preset) {
+        count = preset;
+    }
+
+    function formatNumber(n) {
+        return n.toLocaleString();
+    }
 </script>
 
 <OverlayPanel bind:this={panel} class="seed-data-panel overlay-panel-lg" popup on:hide on:show>
@@ -104,6 +138,12 @@
         <h4>
             <i class="ri-seedling-line" aria-hidden="true" />
             <span class="txt">Generate Seed Data</span>
+            {#if isFastMode}
+                <span class="fast-mode-badge" transition:slide={{ duration: 150, axis: "x" }}>
+                    <i class="ri-flashlight-line" aria-hidden="true" />
+                    Fast Mode
+                </span>
+            {/if}
         </h4>
     </svelte:fragment>
 
@@ -113,46 +153,86 @@
             <strong>{collection?.name}</strong>.
         </p>
 
-        <div class="grid">
-            <div class="col-sm-4">
-                <Field class="form-field required" name="count" let:uniqueId>
-                    <label for={uniqueId}>Number of records</label>
-                    <input
-                        type="number"
-                        id={uniqueId}
-                        bind:value={count}
-                        min="1"
-                        max="50"
-                        required
+        <!-- Count Selection -->
+        <div class="count-section m-b-base">
+            <div class="count-header">
+                <label class="count-label">Number of records</label>
+                <span class="estimated-time" class:fast={isFastMode}>
+                    <i class={isFastMode ? "ri-flashlight-line" : "ri-time-line"} aria-hidden="true" />
+                    {estimatedTime}
+                </span>
+            </div>
+            
+            <div class="count-presets">
+                {#each countPresets as preset}
+                    <button
+                        type="button"
+                        class="preset-btn"
+                        class:active={count === preset}
+                        class:fast={preset > HYBRID_THRESHOLD}
                         disabled={isGenerating}
-                    />
-                    <div class="help-block">Max: 50</div>
-                </Field>
+                        on:click={() => setCount(preset)}
+                    >
+                        {formatNumber(preset)}
+                    </button>
+                {/each}
             </div>
 
-            <div class="col-sm-8">
-                <Field class="form-field" name="description" let:uniqueId>
-                    <label for={uniqueId}>
-                        Description
-                        <i
-                            class="ri-information-line link-hint"
-                            use:tooltip={{
-                                text: "Optional context to make the generated data more relevant (e.g., 'blog posts about technology' or 'products for an online bookstore')",
-                                position: "top",
-                            }}
-                        />
-                    </label>
-                    <textarea
-                        id={uniqueId}
-                        bind:value={description}
-                        placeholder="Optional: describe the type of data you want..."
-                        rows="2"
-                        disabled={isGenerating}
-                        on:keydown={handleKeyPress}
-                    />
-                </Field>
+            <div class="count-input-row">
+                <input
+                    type="range"
+                    class="count-slider"
+                    bind:value={count}
+                    min="1"
+                    max={MAX_COUNT}
+                    step="1"
+                    disabled={isGenerating}
+                />
+                <input
+                    type="number"
+                    class="count-input"
+                    bind:value={count}
+                    min="1"
+                    max={MAX_COUNT}
+                    required
+                    disabled={isGenerating}
+                />
             </div>
+
+            {#if isFastMode}
+                <p class="mode-hint fast" transition:slide={{ duration: 150 }}>
+                    <i class="ri-information-line" aria-hidden="true" />
+                    Fast mode uses AI archetypes + procedural generation for speed
+                </p>
+            {:else}
+                <p class="mode-hint" transition:slide={{ duration: 150 }}>
+                    <i class="ri-information-line" aria-hidden="true" />
+                    Pure AI mode generates each record individually
+                </p>
+            {/if}
         </div>
+
+        <!-- Description -->
+        <Field class="form-field m-b-base" name="description" let:uniqueId>
+            <label for={uniqueId}>
+                Description
+                <i
+                    class="ri-information-line link-hint"
+                    use:tooltip={{
+                        text: "Optional context to make the generated data more relevant (e.g., 'blog posts about technology' or 'products for an online bookstore')",
+                        position: "top",
+                    }}
+                />
+            </label>
+            <textarea
+                id={uniqueId}
+                bind:value={description}
+                placeholder="Optional: describe the type of data you want..."
+                rows="2"
+                disabled={isGenerating}
+                on:keydown={handleKeyPress}
+            />
+        </Field>
 
         {#if generatableFields.length > 0}
             <div class="fields-preview m-t-base" transition:slide={{ duration: 150 }}>
@@ -219,17 +299,25 @@
                 {:else}
                     <div class="alert alert-success">
                         <i class="ri-check-line" />
-                        <strong>{result.created}</strong> record{result.created !== 1 ? "s" : ""} created
-                        {#if result.skipped > 0}
-                            <span class="txt-hint">
-                                ({result.skipped} skipped due to validation errors)
-                            </span>
-                        {/if}
-                        {#if result.total < count && result.skipped === 0}
-                            <span class="txt-hint">
-                                (AI returned {result.total} instead of {count})
-                            </span>
-                        {/if}
+                        <div class="result-content">
+                            <strong>{formatNumber(result.created)}</strong> record{result.created !== 1 ? "s" : ""} created
+                            {#if result.mode === "hybrid"}
+                                <span class="mode-tag fast">
+                                    <i class="ri-flashlight-line" aria-hidden="true" />
+                                    Fast
+                                </span>
+                            {/if}
+                            {#if result.skipped > 0}
+                                <span class="txt-hint">
+                                    ({formatNumber(result.skipped)} skipped due to validation errors)
+                                </span>
+                            {/if}
+                            {#if result.total < count && result.skipped === 0}
+                                <span class="txt-hint">
+                                    (AI returned {formatNumber(result.total)} instead of {formatNumber(count)})
+                                </span>
+                            {/if}
+                        </div>
                     </div>
                     {#if result.errors && result.errors.length > 0}
                         <div class="error-details m-t-sm">
@@ -254,11 +342,16 @@
             type="button"
             class="btn btn-expanded"
             class:btn-loading={isGenerating}
+            class:btn-success={isFastMode}
             disabled={isGenerating || generatableFields.length === 0}
             on:click={() => generateSeedData()}
         >
-            <i class="ri-magic-line" aria-hidden="true" />
-            <span class="txt">Generate {count} Record{count !== 1 ? "s" : ""}</span>
+            {#if isFastMode}
+                <i class="ri-flashlight-line" aria-hidden="true" />
+            {:else}
+                <i class="ri-magic-line" aria-hidden="true" />
+            {/if}
+            <span class="txt">Generate {formatNumber(count)} Record{count !== 1 ? "s" : ""}</span>
         </button>
     </svelte:fragment>
 </OverlayPanel>
@@ -275,6 +368,187 @@
         color: var(--successColor);
     }
 
+    /* Fast mode badge in header */
+    .fast-mode-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 3px 8px;
+        background: linear-gradient(135deg, var(--successColor), #10b981);
+        color: white;
+        border-radius: 12px;
+        font-size: 0.7em;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .fast-mode-badge i {
+        font-size: 1em;
+        color: white;
+    }
+
+    /* Count section */
+    .count-section {
+        background: var(--baseAlt1Color);
+        border-radius: var(--baseRadius);
+        padding: 16px;
+    }
+
+    .count-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 12px;
+    }
+
+    .count-label {
+        font-weight: 600;
+        font-size: 0.9em;
+    }
+
+    .estimated-time {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 0.85em;
+        color: var(--txtHintColor);
+        padding: 4px 8px;
+        background: var(--baseAlt2Color);
+        border-radius: 8px;
+    }
+
+    .estimated-time.fast {
+        background: rgba(16, 185, 129, 0.15);
+        color: var(--successColor);
+    }
+
+    .estimated-time i {
+        font-size: 1em;
+    }
+
+    /* Count presets */
+    .count-presets {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 12px;
+    }
+
+    .preset-btn {
+        padding: 6px 12px;
+        border: 1px solid var(--borderColor);
+        border-radius: 6px;
+        background: var(--baseColor);
+        color: var(--txtPrimaryColor);
+        font-size: 0.85em;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .preset-btn:hover:not(:disabled) {
+        border-color: var(--primaryColor);
+        background: var(--primaryAltColor);
+    }
+
+    .preset-btn.active {
+        border-color: var(--primaryColor);
+        background: var(--primaryColor);
+        color: var(--primaryFgColor);
+    }
+
+    .preset-btn.fast:not(.active) {
+        border-color: rgba(16, 185, 129, 0.3);
+    }
+
+    .preset-btn.fast:hover:not(:disabled):not(.active) {
+        border-color: var(--successColor);
+        background: rgba(16, 185, 129, 0.1);
+    }
+
+    .preset-btn.fast.active {
+        background: var(--successColor);
+        border-color: var(--successColor);
+    }
+
+    .preset-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    /* Count input row */
+    .count-input-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 8px;
+    }
+
+    .count-slider {
+        flex: 1;
+        height: 6px;
+        border-radius: 3px;
+        background: var(--borderColor);
+        appearance: none;
+        cursor: pointer;
+    }
+
+    .count-slider::-webkit-slider-thumb {
+        appearance: none;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: var(--primaryColor);
+        cursor: pointer;
+        border: 2px solid var(--baseColor);
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    }
+
+    .count-slider::-moz-range-thumb {
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: var(--primaryColor);
+        cursor: pointer;
+        border: 2px solid var(--baseColor);
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    }
+
+    .count-input {
+        width: 100px;
+        padding: 8px 12px;
+        border: 1px solid var(--borderColor);
+        border-radius: var(--baseRadius);
+        font-size: 0.95em;
+        text-align: center;
+        font-weight: 600;
+    }
+
+    .count-input:focus {
+        outline: none;
+        border-color: var(--primaryColor);
+    }
+
+    /* Mode hint */
+    .mode-hint {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.8em;
+        color: var(--txtHintColor);
+        margin: 0;
+    }
+
+    .mode-hint.fast {
+        color: var(--successColor);
+    }
+
+    .mode-hint i {
+        font-size: 1em;
+    }
+
+    /* Fields preview */
     .fields-preview {
         background: var(--baseAlt1Color);
         border-radius: var(--baseRadius);
@@ -326,6 +600,7 @@
         padding-left: 20px;
     }
 
+    /* Alerts */
     .alert {
         display: flex;
         align-items: flex-start;
@@ -349,9 +624,48 @@
         color: var(--warningColor);
     }
 
+    /* Result content */
+    .result-content {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .mode-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.75em;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+
+    .mode-tag.fast {
+        background: rgba(16, 185, 129, 0.15);
+        color: var(--successColor);
+    }
+
+    .mode-tag i {
+        font-size: 0.9em;
+    }
+
     textarea {
         resize: vertical;
         min-height: 60px;
+    }
+
+    /* Success button variant */
+    :global(.btn-success) {
+        background: var(--successColor) !important;
+        border-color: var(--successColor) !important;
+    }
+
+    :global(.btn-success:hover:not(:disabled)) {
+        background: #059669 !important;
+        border-color: #059669 !important;
     }
 </style>
 
