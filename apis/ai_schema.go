@@ -2,10 +2,12 @@ package apis
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/forms"
 	"github.com/pocketbase/pocketbase/tools/router"
 )
 
@@ -14,6 +16,7 @@ func bindAIApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	subGroup := rg.Group("/ai").Bind(RequireSuperuserAuth())
 	subGroup.POST("/generate-schema", aiGenerateSchema)
 	subGroup.POST("/test-connection", aiTestConnection)
+	subGroup.POST("/generate-seed-data", aiGenerateSeedData)
 }
 
 func aiGenerateSchema(e *core.RequestEvent) error {
@@ -85,5 +88,77 @@ func aiTestConnection(e *core.RequestEvent) error {
 		"success": true,
 		"message": "Connection successful",
 	})
+}
+
+// aiGenerateSeedData generates sample records for a collection using AI.
+func aiGenerateSeedData(e *core.RequestEvent) error {
+	var req struct {
+		CollectionId string `json:"collectionId"`
+		Count        int    `json:"count"`
+		Description  string `json:"description"`
+	}
+
+	if err := e.BindBody(&req); err != nil {
+		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
+	}
+
+	// Validate request
+	if err := validation.ValidateStruct(&req,
+		validation.Field(&req.CollectionId, validation.Required),
+		validation.Field(&req.Count, validation.Required, validation.Min(1), validation.Max(50)),
+	); err != nil {
+		return e.BadRequestError("Invalid request data.", err)
+	}
+
+	// Find the collection
+	collection, err := e.App.FindCollectionByNameOrId(req.CollectionId)
+	if err != nil {
+		return e.NotFoundError("Collection not found.", err)
+	}
+
+	// Don't allow seed data for view collections
+	if collection.IsView() {
+		return e.BadRequestError("Cannot generate seed data for view collections.", nil)
+	}
+
+	// Generate seed data using AI service
+	records, err := core.GenerateSeedDataFromSchema(e.App, collection, req.Count, req.Description)
+	if err != nil {
+		return e.BadRequestError("Failed to generate seed data: "+err.Error(), nil)
+	}
+
+	// Create the records in the database
+	created := 0
+	skipped := 0
+	var creationErrors []string
+
+	for i, recordData := range records {
+		record := core.NewRecord(collection)
+		form := forms.NewRecordUpsert(e.App, record)
+		form.GrantSuperuserAccess()
+		form.Load(recordData)
+
+		if err := form.Submit(); err != nil {
+			skipped++
+			creationErrors = append(creationErrors,
+				fmt.Sprintf("Record %d: %s", i+1, err.Error()))
+			continue
+		}
+		created++
+	}
+
+	response := map[string]interface{}{
+		"created": created,
+		"skipped": skipped,
+		"total":   len(records),
+	}
+
+	if len(creationErrors) > 0 && len(creationErrors) <= 5 {
+		response["errors"] = creationErrors
+	} else if len(creationErrors) > 5 {
+		response["errors"] = append(creationErrors[:5], "... and more")
+	}
+
+	return e.JSON(http.StatusOK, response)
 }
 

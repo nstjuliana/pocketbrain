@@ -318,3 +318,265 @@ CRITICAL RULES:
 	return basePrompt
 }
 
+// GenerateSeedDataRequest represents a request to generate seed data for a collection.
+type GenerateSeedDataRequest struct {
+	CollectionId string `json:"collectionId"`
+	Count        int    `json:"count"`
+	Description  string `json:"description,omitempty"` // Optional context for data generation
+}
+
+// GenerateSeedDataResponse represents the response from seed data generation.
+type GenerateSeedDataResponse struct {
+	Records []map[string]any `json:"records"`
+	Created int              `json:"created"`
+	Skipped int              `json:"skipped"`
+	Error   string           `json:"error,omitempty"`
+}
+
+// SeedFieldInfo represents simplified field info for the AI prompt.
+type SeedFieldInfo struct {
+	Name      string   `json:"name"`
+	Type      string   `json:"type"`
+	Min       float64  `json:"min,omitempty"`
+	Max       float64  `json:"max,omitempty"`
+	Values    []string `json:"values,omitempty"` // For select fields
+	MaxSelect int      `json:"maxSelect,omitempty"`
+}
+
+// GenerateSeedDataFromSchema uses OpenAI to generate realistic sample records for a collection.
+func GenerateSeedDataFromSchema(app App, collection *Collection, count int, description string) ([]map[string]any, error) {
+	settings := app.Settings()
+
+	if !settings.AI.Enabled {
+		return nil, fmt.Errorf("AI features are not enabled")
+	}
+
+	if settings.AI.APIKey == "" {
+		return nil, fmt.Errorf("AI API key is not configured")
+	}
+
+	if settings.AI.Provider != "openai" {
+		return nil, fmt.Errorf("unsupported AI provider: %s", settings.AI.Provider)
+	}
+
+	if count <= 0 {
+		return nil, fmt.Errorf("count must be greater than 0")
+	}
+
+	// Cap count to prevent excessive API usage
+	if count > 50 {
+		count = 50
+	}
+
+	// Extract field information for the prompt
+	fields := extractSeedFieldsInfo(collection)
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("collection has no fields suitable for seed data generation")
+	}
+
+	// Build the system prompt
+	systemPrompt := buildSeedDataSystemPrompt()
+
+	// Build the user prompt
+	userPrompt := buildSeedDataUserPrompt(collection.Name, fields, count, description)
+
+	// Prepare OpenAI API request
+	openAIReq := map[string]interface{}{
+		"model": settings.AI.Model,
+		"messages": []map[string]string{
+			{
+				"role":    "system",
+				"content": systemPrompt,
+			},
+			{
+				"role":    "user",
+				"content": userPrompt,
+			},
+		},
+		"temperature": 0.7, // Slightly higher for more varied data
+		"response_format": map[string]string{
+			"type": "json_object",
+		},
+	}
+
+	reqBody, err := json.Marshal(openAIReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal OpenAI request: %w", err)
+	}
+
+	// Create HTTP request
+	httpReq, err := http.NewRequest("POST", openAIAPIURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", settings.AI.APIKey))
+
+	// Make the request with longer timeout for larger data generation
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call OpenAI API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read OpenAI response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpenAI API error (status %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	// Parse OpenAI response
+	var openAIResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(respBody, &openAIResp); err != nil {
+		return nil, fmt.Errorf("failed to parse OpenAI response: %w", err)
+	}
+
+	if len(openAIResp.Choices) == 0 {
+		return nil, fmt.Errorf("no response from OpenAI")
+	}
+
+	content := openAIResp.Choices[0].Message.Content
+
+	// Parse the records JSON from the response
+	var result struct {
+		Records []map[string]any `json:"records"`
+	}
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse records JSON: %w", err)
+	}
+
+	return result.Records, nil
+}
+
+// extractSeedFieldsInfo extracts field information suitable for seed data generation.
+// It skips fields that cannot be auto-generated (relations, files, autodate, password).
+func extractSeedFieldsInfo(collection *Collection) []SeedFieldInfo {
+	var fields []SeedFieldInfo
+
+	// Field types to skip
+	skipTypes := map[string]bool{
+		FieldTypeRelation: true,
+		FieldTypeFile:     true,
+		FieldTypeAutodate: true,
+	}
+
+	for _, field := range collection.Fields {
+		fieldType := field.Type()
+		fieldName := field.GetName()
+
+		// Skip system fields
+		if fieldName == "id" || fieldName == "created" || fieldName == "updated" {
+			continue
+		}
+
+		// Skip password field for auth collections
+		if fieldName == FieldNamePassword {
+			continue
+		}
+
+		// Skip relation, file, autodate fields
+		if skipTypes[fieldType] {
+			continue
+		}
+
+		info := SeedFieldInfo{
+			Name: fieldName,
+			Type: fieldType,
+		}
+
+		// Extract type-specific options
+		switch f := field.(type) {
+		case *NumberField:
+			if f.Min != nil {
+				info.Min = *f.Min
+			}
+			if f.Max != nil {
+				info.Max = *f.Max
+			}
+		case *TextField:
+			info.Min = float64(f.Min)
+			info.Max = float64(f.Max)
+		case *SelectField:
+			info.Values = f.Values
+			info.MaxSelect = f.MaxSelect
+		}
+
+		fields = append(fields, info)
+	}
+
+	return fields
+}
+
+// buildSeedDataSystemPrompt creates the system prompt for seed data generation.
+func buildSeedDataSystemPrompt() string {
+	return `You are a data generator for PocketBase. Generate realistic, varied sample data based on field schemas.
+
+RULES:
+1. Return a JSON object with a "records" array containing the requested number of records
+2. Each record should have realistic, varied data appropriate for the field names and types
+3. DO NOT include "id", "created", or "updated" fields - they are auto-generated
+4. Match data types exactly:
+   - text: strings appropriate to the field name (e.g., "title" → article titles, "description" → paragraphs)
+   - number: numbers within min/max constraints if provided
+   - bool: true or false
+   - email: valid email addresses (use example.com domain)
+   - url: valid URLs (use example.com domain)
+   - editor: HTML content with basic formatting
+   - date: ISO 8601 datetime strings (e.g., "2024-01-15 10:30:00.000Z")
+   - select: values ONLY from the provided "values" array. If maxSelect=1, use a single string. If maxSelect>1, use an array of strings (up to maxSelect items).
+   - json: appropriate JSON objects/arrays based on field name
+5. Make data realistic and contextually appropriate:
+   - If field is "name", generate realistic names
+   - If field is "price", generate realistic prices
+   - If field is "status", use typical status values
+6. Ensure variety - don't repeat the same values across records
+7. Always provide values for all fields to ensure valid records
+
+OUTPUT FORMAT:
+{
+  "records": [
+    { "field1": "value1", "field2": 123, ... },
+    { "field1": "value2", "field2": 456, ... }
+  ]
+}`
+}
+
+// buildSeedDataUserPrompt creates the user prompt for seed data generation.
+func buildSeedDataUserPrompt(collectionName string, fields []SeedFieldInfo, count int, description string) string {
+	fieldsJSON, _ := json.MarshalIndent(fields, "", "  ")
+
+	prompt := fmt.Sprintf(`Generate %d sample records for a "%s" collection.
+
+Field Schema:
+%s`, count, collectionName, string(fieldsJSON))
+
+	if description != "" {
+		prompt += fmt.Sprintf(`
+
+Context/Description: %s
+
+Use this context to make the generated data more relevant and realistic.`, description)
+	}
+
+	prompt += `
+
+Return a JSON object with a "records" array containing the generated records.`
+
+	return prompt
+}
+
