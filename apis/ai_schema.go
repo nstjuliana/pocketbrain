@@ -20,6 +20,8 @@ func bindAIApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	subGroup.POST("/generate-embeddings", aiGenerateEmbeddings)
 	subGroup.POST("/find-similar", aiFindSimilar)
 	subGroup.GET("/embedding-stats", aiGetEmbeddingStats)
+	subGroup.GET("/embedding-cache-stats", aiGetEmbeddingCacheStats)
+	subGroup.POST("/clear-embedding-cache", aiClearEmbeddingCache)
 }
 
 func aiGenerateSchema(e *core.RequestEvent) error {
@@ -207,12 +209,15 @@ func aiGenerateEmbeddings(e *core.RequestEvent) error {
 		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
 	}
 
-	// Validate request
-	if err := validation.ValidateStruct(&req,
-		validation.Field(&req.CollectionId, validation.Required),
-		validation.Field(&req.FieldName, validation.Required),
-	); err != nil {
-		return e.BadRequestError("Invalid request data.", err)
+	// Validate request - CollectionId is always required
+	// FieldName is only required for field-level mode (not record mode)
+	if req.CollectionId == "" {
+		return e.BadRequestError("collectionId is required.", nil)
+	}
+
+	// For field mode (default), fieldName is required
+	if req.Mode != core.EmbeddingModeRecord && req.FieldName == "" {
+		return e.BadRequestError("fieldName is required for field-level embedding mode.", nil)
 	}
 
 	// Generate embeddings
@@ -232,13 +237,19 @@ func aiFindSimilar(e *core.RequestEvent) error {
 		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
 	}
 
-	// Validate request
-	if err := validation.ValidateStruct(&req,
-		validation.Field(&req.CollectionId, validation.Required),
-		validation.Field(&req.FieldName, validation.Required),
-		validation.Field(&req.Limit, validation.Min(1), validation.Max(100)),
-	); err != nil {
-		return e.BadRequestError("Invalid request data.", err)
+	// Validate request - CollectionId is always required
+	if req.CollectionId == "" {
+		return e.BadRequestError("collectionId is required.", nil)
+	}
+
+	// For field mode (default), fieldName is required
+	if req.Mode != core.EmbeddingModeRecord && req.FieldName == "" {
+		return e.BadRequestError("fieldName is required for field-level search mode.", nil)
+	}
+
+	// Validate limit
+	if req.Limit < 0 || req.Limit > 100 {
+		return e.BadRequestError("limit must be between 1 and 100.", nil)
 	}
 
 	// Require either text or recordId
@@ -275,5 +286,17 @@ func aiGetEmbeddingStats(e *core.RequestEvent) error {
 	}
 
 	return e.JSON(http.StatusOK, stats)
+}
+
+// aiGetEmbeddingCacheStats returns statistics about the embedding cache.
+func aiGetEmbeddingCacheStats(e *core.RequestEvent) error {
+	stats := core.GetEmbeddingCacheStats()
+	return e.JSON(http.StatusOK, stats)
+}
+
+// aiClearEmbeddingCache clears the embedding cache.
+func aiClearEmbeddingCache(e *core.RequestEvent) error {
+	core.ClearEmbeddingCache()
+	return e.JSON(http.StatusOK, map[string]string{"status": "ok", "message": "Embedding cache cleared"})
 }
 

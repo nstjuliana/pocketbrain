@@ -7,7 +7,10 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"runtime"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/pocketbase/pocketbase/tools/types"
@@ -23,11 +26,268 @@ const (
 	MaxTokensPerBatch = 8000
 )
 
+const (
+	// EmbeddingCacheMaxMemoryMB is the total memory budget for the cache in megabytes
+	// When exceeded, oldest entries are evicted until under budget
+	EmbeddingCacheMaxMemoryMB = 500 // 500MB total budget
+
+	// EmbeddingCacheMaxPerEntry limits embeddings per entry (secondary protection)
+	// Prevents a single huge collection from consuming the entire budget
+	EmbeddingCacheMaxPerEntry = 50000
+
+	// EmbeddingCacheTTL is how long cached embeddings remain valid (sliding window)
+	EmbeddingCacheTTL = 10 * time.Minute
+
+	// embeddingMemoryPerRecord is the estimated memory per cached embedding in bytes
+	// 1536 floats × 4 bytes + record ID (~20 bytes) + magnitude (4 bytes) + overhead
+	embeddingMemoryPerRecord = 6200 // ~6.2KB
+)
+
+// embeddingCache stores embeddings in memory for fast similarity search
+var embeddingCache = &EmbeddingCache{
+	cache:     make(map[string]*cacheEntry),
+	accessLog: make([]string, 0, 10),
+}
+
+// cacheEntry stores embeddings with metadata for LRU and TTL
+type cacheEntry struct {
+	embeddings []CachedEmbedding
+	memoryMB   float64 // Estimated memory usage in MB
+	createdAt  time.Time
+	accessedAt time.Time
+}
+
+// EmbeddingCache provides in-memory caching for embeddings with memory-based eviction and TTL
+type EmbeddingCache struct {
+	mu            sync.RWMutex
+	cache         map[string]*cacheEntry // key: "collectionId:fieldName"
+	accessLog     []string               // Track access order for LRU eviction
+	totalMemoryMB float64                // Track total memory usage
+}
+
+// CachedEmbedding stores a pre-loaded embedding with its record ID
+type CachedEmbedding struct {
+	RecordId  string
+	Embedding []float32
+	Magnitude float32 // Pre-computed for faster cosine similarity
+}
+
+// cacheKey generates a cache key from collection ID and field name
+func cacheKey(collectionId, fieldName string) string {
+	return collectionId + ":" + fieldName
+}
+
+// Get retrieves cached embeddings for a collection/field
+func (c *EmbeddingCache) Get(collectionId, fieldName string) ([]CachedEmbedding, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := cacheKey(collectionId, fieldName)
+	entry, ok := c.cache[key]
+	if !ok {
+		return nil, false
+	}
+
+	// Check TTL expiration (sliding window - resets on each access)
+	if time.Since(entry.accessedAt) > EmbeddingCacheTTL {
+		delete(c.cache, key)
+		c.removeFromAccessLog(key)
+		return nil, false
+	}
+
+	// Update access time for LRU and sliding TTL
+	entry.accessedAt = time.Now()
+	c.moveToEndOfAccessLog(key)
+
+	return entry.embeddings, true
+}
+
+// Set stores embeddings in the cache with memory-based eviction
+// Returns true if cached, false if skipped (too large for single entry)
+func (c *EmbeddingCache) Set(collectionId, fieldName string, embeddings []CachedEmbedding) bool {
+	// Skip caching if single entry exceeds per-entry limit
+	if len(embeddings) > EmbeddingCacheMaxPerEntry {
+		return false
+	}
+
+	// Calculate memory for this entry
+	entryMemoryMB := float64(len(embeddings)*embeddingMemoryPerRecord) / (1024 * 1024)
+
+	// Skip if single entry would exceed entire budget
+	if entryMemoryMB > EmbeddingCacheMaxMemoryMB {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := cacheKey(collectionId, fieldName)
+
+	// If updating existing entry, subtract its old memory first
+	if existing, ok := c.cache[key]; ok {
+		c.totalMemoryMB -= existing.memoryMB
+	}
+
+	// Evict oldest entries until we have room for the new entry
+	for c.totalMemoryMB+entryMemoryMB > EmbeddingCacheMaxMemoryMB && len(c.accessLog) > 0 {
+		oldestKey := c.accessLog[0]
+		if oldEntry, ok := c.cache[oldestKey]; ok {
+			c.totalMemoryMB -= oldEntry.memoryMB
+			delete(c.cache, oldestKey)
+		}
+		c.accessLog = c.accessLog[1:]
+	}
+
+	now := time.Now()
+	c.cache[key] = &cacheEntry{
+		embeddings: embeddings,
+		memoryMB:   entryMemoryMB,
+		createdAt:  now,
+		accessedAt: now,
+	}
+	c.totalMemoryMB += entryMemoryMB
+
+	// Add to access log if not already present
+	c.removeFromAccessLog(key)
+	c.accessLog = append(c.accessLog, key)
+	return true
+}
+
+// Invalidate removes cached embeddings for a collection/field
+func (c *EmbeddingCache) Invalidate(collectionId, fieldName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := cacheKey(collectionId, fieldName)
+	if entry, ok := c.cache[key]; ok {
+		c.totalMemoryMB -= entry.memoryMB
+		delete(c.cache, key)
+	}
+	c.removeFromAccessLog(key)
+}
+
+// InvalidateCollection removes all cached embeddings for a collection
+func (c *EmbeddingCache) InvalidateCollection(collectionId string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prefix := collectionId + ":"
+	for key, entry := range c.cache {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			c.totalMemoryMB -= entry.memoryMB
+			delete(c.cache, key)
+			c.removeFromAccessLog(key)
+		}
+	}
+}
+
+// removeFromAccessLog removes a key from the access log (helper, must hold lock)
+func (c *EmbeddingCache) removeFromAccessLog(key string) {
+	for i, k := range c.accessLog {
+		if k == key {
+			c.accessLog = append(c.accessLog[:i], c.accessLog[i+1:]...)
+			return
+		}
+	}
+}
+
+// moveToEndOfAccessLog moves a key to the end of access log (most recently used)
+func (c *EmbeddingCache) moveToEndOfAccessLog(key string) {
+	c.removeFromAccessLog(key)
+	c.accessLog = append(c.accessLog, key)
+}
+
+// Stats returns cache statistics for monitoring
+func (c *EmbeddingCache) Stats() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	totalEmbeddings := 0
+	entries := make([]map[string]any, 0, len(c.cache))
+
+	for key, entry := range c.cache {
+		count := len(entry.embeddings)
+		totalEmbeddings += count
+
+		entries = append(entries, map[string]any{
+			"key":        key,
+			"count":      count,
+			"memoryMB":   entry.memoryMB,
+			"age":        time.Since(entry.createdAt).String(),
+			"lastAccess": time.Since(entry.accessedAt).String(),
+		})
+	}
+
+	return map[string]any{
+		"entriesCount":     len(c.cache),
+		"totalEmbeddings":  totalEmbeddings,
+		"memoryUsedMB":     c.totalMemoryMB,
+		"memoryBudgetMB":   EmbeddingCacheMaxMemoryMB,
+		"memoryUsagePercent": (c.totalMemoryMB / EmbeddingCacheMaxMemoryMB) * 100,
+		"maxPerEntry":      EmbeddingCacheMaxPerEntry,
+		"ttl":              EmbeddingCacheTTL.String(),
+		"entries":          entries,
+	}
+}
+
+// Clear removes all cached embeddings
+func (c *EmbeddingCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = make(map[string]*cacheEntry)
+	c.accessLog = make([]string, 0, 10)
+	c.totalMemoryMB = 0
+}
+
+// Info returns a summary of cache state
+func (c *EmbeddingCache) Info() *CacheInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return &CacheInfo{
+		EntriesCount:       len(c.cache),
+		MemoryUsedMB:       c.totalMemoryMB,
+		MemoryBudgetMB:     EmbeddingCacheMaxMemoryMB,
+		MemoryUsagePercent: (c.totalMemoryMB / EmbeddingCacheMaxMemoryMB) * 100,
+	}
+}
+
+// computeMagnitude calculates the magnitude (L2 norm) of a vector
+func computeMagnitude(v []float32) float32 {
+	var sum float32
+	for _, val := range v {
+		sum += val * val
+	}
+	return float32(math.Sqrt(float64(sum)))
+}
+
+// GetEmbeddingCacheStats returns statistics about the embedding cache
+func GetEmbeddingCacheStats() map[string]any {
+	return embeddingCache.Stats()
+}
+
+// ClearEmbeddingCache clears all cached embeddings
+func ClearEmbeddingCache() {
+	embeddingCache.Clear()
+}
+
+const (
+	// RecordLevelFieldName is the special field name used for record-level embeddings
+	RecordLevelFieldName = "_record"
+)
+
+// EmbeddingMode represents the mode for embedding generation
+type EmbeddingMode string
+
+const (
+	EmbeddingModeField  EmbeddingMode = "field"  // Embed individual fields
+	EmbeddingModeRecord EmbeddingMode = "record" // Embed entire record as one text
+)
+
 // EmbeddingRequest represents a request to generate embeddings for records.
 type EmbeddingRequest struct {
-	CollectionId string   `json:"collectionId"`
-	FieldName    string   `json:"fieldName"`
-	RecordIds    []string `json:"recordIds,omitempty"` // If empty, process all records
+	CollectionId string        `json:"collectionId"`
+	FieldName    string        `json:"fieldName,omitempty"`              // For field-level mode
+	Mode         EmbeddingMode `json:"mode,omitempty"`                   // "field" or "record"
+	RecordIds    []string      `json:"recordIds,omitempty"`              // If empty, process all records
+	Template     string        `json:"template,omitempty"`               // Optional template for record-level mode
 }
 
 // EmbeddingResponse represents the response from embedding generation.
@@ -45,11 +305,12 @@ type SimilarRecord struct {
 
 // FindSimilarRequest represents a request to find similar records.
 type FindSimilarRequest struct {
-	CollectionId string  `json:"collectionId"`
-	FieldName    string  `json:"fieldName"`
-	Text         string  `json:"text,omitempty"`   // Text to find similar records for
-	RecordId     string  `json:"recordId,omitempty"` // Or use existing record's embedding
-	Limit        int     `json:"limit"`
+	CollectionId string        `json:"collectionId"`
+	FieldName    string        `json:"fieldName,omitempty"` // For field-level search
+	Mode         EmbeddingMode `json:"mode,omitempty"`      // "field" or "record"
+	Text         string        `json:"text,omitempty"`      // Text to find similar records for
+	RecordId     string        `json:"recordId,omitempty"`  // Or use existing record's embedding
+	Limit        int           `json:"limit"`
 }
 
 // FindSimilarResponse represents the response from finding similar records.
@@ -60,13 +321,24 @@ type FindSimilarResponse struct {
 
 // SimilarityDebug contains debug information for similarity search
 type SimilarityDebug struct {
-	CollectionId      string   `json:"collectionId"`
-	FieldName         string   `json:"fieldName"`
-	QueryEmbeddingLen int      `json:"queryEmbeddingLen"`
-	StoredEmbeddings  int      `json:"storedEmbeddings"`
-	ProcessedCount    int      `json:"processedCount"`
-	ErrorCount        int      `json:"errorCount"`
-	Errors            []string `json:"errors,omitempty"`
+	CollectionId      string     `json:"collectionId"`
+	FieldName         string     `json:"fieldName"`
+	QueryEmbeddingLen int        `json:"queryEmbeddingLen"`
+	StoredEmbeddings  int        `json:"storedEmbeddings"`
+	ProcessedCount    int        `json:"processedCount"`
+	ErrorCount        int        `json:"errorCount"`
+	CacheHit          bool       `json:"cacheHit"`
+	CacheSkipped      bool       `json:"cacheSkipped,omitempty"` // True if too large to cache
+	CacheStats        *CacheInfo `json:"cacheStats,omitempty"`
+	Errors            []string   `json:"errors,omitempty"`
+}
+
+// CacheInfo contains summary info about the embedding cache
+type CacheInfo struct {
+	EntriesCount       int     `json:"entriesCount"`
+	MemoryUsedMB       float64 `json:"memoryUsedMB"`
+	MemoryBudgetMB     float64 `json:"memoryBudgetMB"`
+	MemoryUsagePercent float64 `json:"memoryUsagePercent"`
 }
 
 // OpenAI Embeddings API structures
@@ -91,7 +363,76 @@ type openAIEmbeddingResponse struct {
 	} `json:"usage"`
 }
 
-// GenerateEmbeddings generates vector embeddings for the specified records' text field.
+// GenerateRecordText creates a text representation of an entire record for embedding.
+// It concatenates all text and editor fields into a structured format.
+// If a template is provided, it uses that instead (supports {fieldName} placeholders).
+func GenerateRecordText(record *Record, collection *Collection, template string) string {
+	if template != "" {
+		// Use custom template with {fieldName} placeholders
+		result := template
+		for _, field := range collection.Fields {
+			placeholder := "{" + field.GetName() + "}"
+			value := record.GetString(field.GetName())
+			// Strip HTML for editor fields
+			if field.Type() == "editor" {
+				value = stripHTML(value)
+			}
+			result = strings.ReplaceAll(result, placeholder, value)
+		}
+		return strings.TrimSpace(result)
+	}
+
+	// Default format: structured key-value pairs
+	var parts []string
+	for _, field := range collection.Fields {
+		fieldType := field.Type()
+		// Include text, editor, and some other useful fields
+		if fieldType == "text" || fieldType == "editor" || fieldType == "email" || fieldType == "url" {
+			name := field.GetName()
+			value := record.GetString(name)
+			if value == "" {
+				continue
+			}
+			// Strip HTML for editor fields
+			if fieldType == "editor" {
+				value = stripHTML(value)
+			}
+			// Truncate very long values to avoid token limits
+			if len(value) > 2000 {
+				value = value[:2000] + "..."
+			}
+			parts = append(parts, fmt.Sprintf("%s: %s", name, value))
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// stripHTML removes HTML tags from a string
+func stripHTML(s string) string {
+	// Simple HTML stripping - removes tags
+	result := s
+	for {
+		start := strings.Index(result, "<")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(result[start:], ">")
+		if end == -1 {
+			break
+		}
+		result = result[:start] + " " + result[start+end+1:]
+	}
+	// Clean up multiple spaces
+	for strings.Contains(result, "  ") {
+		result = strings.ReplaceAll(result, "  ", " ")
+	}
+	return strings.TrimSpace(result)
+}
+
+// GenerateEmbeddings generates vector embeddings for records.
+// Supports two modes:
+// - "field" (default): Embed a specific text/editor field
+// - "record": Embed the entire record as a single text representation
 func GenerateEmbeddings(app App, req EmbeddingRequest) (*EmbeddingResponse, error) {
 	settings := app.Settings()
 
@@ -113,15 +454,30 @@ func GenerateEmbeddings(app App, req EmbeddingRequest) (*EmbeddingResponse, erro
 		return nil, fmt.Errorf("collection not found: %w", err)
 	}
 
-	// Verify the field exists and is embeddable
-	field := collection.Fields.GetByName(req.FieldName)
-	if field == nil {
-		return nil, fmt.Errorf("field '%s' not found in collection", req.FieldName)
+	// Determine embedding mode (default to field-level for backwards compatibility)
+	mode := req.Mode
+	if mode == "" {
+		mode = EmbeddingModeField
 	}
 
-	// Check if field is embeddable (supports both text and editor fields)
-	if !IsFieldEmbeddable(field) {
-		return nil, fmt.Errorf("field '%s' is not a text/editor field or is not marked as embeddable", req.FieldName)
+	// For field mode, verify the field exists and is embeddable
+	fieldName := req.FieldName
+	if mode == EmbeddingModeField {
+		if fieldName == "" {
+			return nil, fmt.Errorf("fieldName is required for field-level embedding mode")
+		}
+		field := collection.Fields.GetByName(fieldName)
+		if field == nil {
+			return nil, fmt.Errorf("field '%s' not found in collection", fieldName)
+		}
+		if !IsFieldEmbeddable(field) {
+			return nil, fmt.Errorf("field '%s' is not a text/editor field or is not marked as embeddable", fieldName)
+		}
+	} else if mode == EmbeddingModeRecord {
+		// For record mode, use special field name
+		fieldName = RecordLevelFieldName
+	} else {
+		return nil, fmt.Errorf("invalid embedding mode: %s (must be 'field' or 'record')", mode)
 	}
 
 	// Ensure embeddings collection exists
@@ -160,7 +516,20 @@ func GenerateEmbeddings(app App, req EmbeddingRequest) (*EmbeddingResponse, erro
 	var textsToEmbed []textRecord
 
 	for _, record := range records {
-		text := record.GetString(req.FieldName)
+		var text string
+		if mode == EmbeddingModeRecord {
+			// Generate full record text representation
+			text = GenerateRecordText(record, collection, req.Template)
+		} else {
+			// Get specific field value
+			text = record.GetString(fieldName)
+			// Strip HTML for editor fields
+			field := collection.Fields.GetByName(fieldName)
+			if field != nil && field.Type() == "editor" {
+				text = stripHTML(text)
+			}
+		}
+
 		if text != "" {
 			textsToEmbed = append(textsToEmbed, textRecord{
 				RecordId: record.Id,
@@ -202,7 +571,7 @@ func GenerateEmbeddings(app App, req EmbeddingRequest) (*EmbeddingResponse, erro
 			err := storeEmbedding(app, embeddingsCollection, StoreEmbeddingParams{
 				RecordId:     tr.RecordId,
 				CollectionId: collection.Id,
-				FieldName:    req.FieldName,
+				FieldName:    fieldName,
 				Embedding:    embedding,
 				Model:        settings.AI.EmbeddingModel,
 				Dimensions:   len(embedding),
@@ -360,7 +729,12 @@ func storeEmbedding(app App, embeddingsCollection *Collection, params StoreEmbed
 	record.Set("model", params.Model)
 	record.Set("dimensions", params.Dimensions)
 
-	return app.Save(record)
+	err = app.Save(record)
+	if err == nil {
+		// Invalidate cache for this collection/field since embeddings changed
+		embeddingCache.Invalidate(params.CollectionId, params.FieldName)
+	}
+	return err
 }
 
 // FindSimilarRecords finds records similar to the given text or record
@@ -377,6 +751,19 @@ func FindSimilarRecords(app App, req FindSimilarRequest) (*FindSimilarResponse, 
 		return nil, fmt.Errorf("collection not found: %w", err)
 	}
 	collectionId := collection.Id // Use the actual ID for queries
+
+	// Determine field name based on mode
+	mode := req.Mode
+	if mode == "" {
+		mode = EmbeddingModeField
+	}
+
+	fieldName := req.FieldName
+	if mode == EmbeddingModeRecord {
+		fieldName = RecordLevelFieldName
+	} else if fieldName == "" {
+		return nil, fmt.Errorf("fieldName is required for field-level search mode")
+	}
 
 	// Get the query embedding
 	var queryEmbedding []float32
@@ -406,7 +793,7 @@ func FindSimilarRecords(app App, req FindSimilarRequest) (*FindSimilarResponse, 
 			0,
 			map[string]any{
 				"recordId":  req.RecordId,
-				"fieldName": req.FieldName,
+				"fieldName": fieldName,
 			},
 		)
 		if err != nil || len(records) == 0 {
@@ -421,62 +808,132 @@ func FindSimilarRecords(app App, req FindSimilarRequest) (*FindSimilarResponse, 
 		return nil, fmt.Errorf("either text or recordId must be provided")
 	}
 
-	// Find all embeddings for this collection/field
-	embeddingsCollection, err := app.FindCollectionByNameOrId(EmbeddingsCollectionName)
-	if err != nil {
-		return nil, fmt.Errorf("embeddings collection not found: %w", err)
-	}
-
-	allEmbeddings, err := app.FindRecordsByFilter(
-		embeddingsCollection.Id,
-		"collection_id = {:collectionId} && field_name = {:fieldName}",
-		"",
-		0, // Get all
-		0,
-		map[string]any{
-			"collectionId": collectionId,
-			"fieldName":    req.FieldName,
-		},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch embeddings: %w", err)
-	}
+	// Try to get embeddings from cache first
+	cachedEmbeddings, cacheHit := embeddingCache.Get(collectionId, fieldName)
 
 	// Debug info
 	debug := &SimilarityDebug{
 		CollectionId:      collectionId,
-		FieldName:         req.FieldName,
+		FieldName:         fieldName,
 		QueryEmbeddingLen: len(queryEmbedding),
-		StoredEmbeddings:  len(allEmbeddings),
 		ProcessedCount:    0,
 		ErrorCount:        0,
+		CacheHit:          cacheHit,
 	}
 
-	// Calculate similarity scores - initialize as empty slice (not nil) for proper JSON
-	results := []SimilarRecord{}
-	for _, embRecord := range allEmbeddings {
-		recordId := embRecord.GetString("record_id")
-
-		// Skip the query record itself
-		if recordId == req.RecordId {
-			continue
-		}
-
-		embedding, err := getEmbeddingFromRecord(embRecord)
+	if !cacheHit {
+		// Load embeddings from database and cache them
+		embeddingsCollection, err := app.FindCollectionByNameOrId(EmbeddingsCollectionName)
 		if err != nil {
-			debug.ErrorCount++
-			// Capture first few errors for debugging
-			if len(debug.Errors) < 3 {
-				debug.Errors = append(debug.Errors, fmt.Sprintf("record %s: %v", recordId, err))
+			return nil, fmt.Errorf("embeddings collection not found: %w", err)
+		}
+
+		allEmbeddings, err := app.FindRecordsByFilter(
+			embeddingsCollection.Id,
+			"collection_id = {:collectionId} && field_name = {:fieldName}",
+			"",
+			0, // Get all
+			0,
+			map[string]any{
+				"collectionId": collectionId,
+				"fieldName":    fieldName,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch embeddings: %w", err)
+		}
+
+		debug.StoredEmbeddings = len(allEmbeddings)
+
+		// Parse and cache all embeddings with pre-computed magnitudes
+		cachedEmbeddings = make([]CachedEmbedding, 0, len(allEmbeddings))
+		for _, embRecord := range allEmbeddings {
+			recordId := embRecord.GetString("record_id")
+			embedding, err := getEmbeddingFromRecord(embRecord)
+			if err != nil {
+				debug.ErrorCount++
+				if len(debug.Errors) < 3 {
+					debug.Errors = append(debug.Errors, fmt.Sprintf("record %s: %v", recordId, err))
+				}
+				continue
 			}
+			cachedEmbeddings = append(cachedEmbeddings, CachedEmbedding{
+				RecordId:  recordId,
+				Embedding: embedding,
+				Magnitude: computeMagnitude(embedding),
+			})
+		}
+
+		// Store in cache for future queries (skipped if too large)
+		cached := embeddingCache.Set(collectionId, fieldName, cachedEmbeddings)
+		if !cached {
+			debug.CacheSkipped = true
+		}
+	} else {
+		debug.StoredEmbeddings = len(cachedEmbeddings)
+	}
+
+	// Pre-compute query magnitude for optimized similarity calculation
+	queryMagnitude := computeMagnitude(queryEmbedding)
+
+	// Use parallel computation for similarity scores
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(cachedEmbeddings) {
+		numWorkers = len(cachedEmbeddings)
+	}
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	// Channel for results
+	type similarityResult struct {
+		recordId   string
+		similarity float32
+	}
+	resultsChan := make(chan similarityResult, len(cachedEmbeddings))
+
+	// Split work across goroutines
+	var wg sync.WaitGroup
+	chunkSize := (len(cachedEmbeddings) + numWorkers - 1) / numWorkers
+
+	for i := 0; i < numWorkers; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(cachedEmbeddings) {
+			end = len(cachedEmbeddings)
+		}
+		if start >= end {
 			continue
 		}
 
+		wg.Add(1)
+		go func(embeddings []CachedEmbedding) {
+			defer wg.Done()
+			for _, cached := range embeddings {
+				// Skip the query record itself
+				if cached.RecordId == req.RecordId {
+					continue
+				}
+				// Optimized cosine similarity using pre-computed magnitudes
+				similarity := cosineSimilarityOptimized(queryEmbedding, queryMagnitude, cached.Embedding, cached.Magnitude)
+				resultsChan <- similarityResult{cached.RecordId, similarity}
+			}
+		}(cachedEmbeddings[start:end])
+	}
+
+	// Close channel when all workers done
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Collect results
+	results := make([]SimilarRecord, 0, len(cachedEmbeddings))
+	for result := range resultsChan {
 		debug.ProcessedCount++
-		similarity := cosineSimilarity(queryEmbedding, embedding)
 		results = append(results, SimilarRecord{
-			RecordId:   recordId,
-			Similarity: similarity,
+			RecordId:   result.recordId,
+			Similarity: result.similarity,
 		})
 	}
 
@@ -494,6 +951,9 @@ func FindSimilarRecords(app App, req FindSimilarRequest) (*FindSimilarResponse, 
 		limit = len(results)
 	}
 	results = results[:limit]
+
+	// Add cache stats to debug info
+	debug.CacheStats = embeddingCache.Info()
 
 	return &FindSimilarResponse{Results: results, Debug: debug}, nil
 }
@@ -516,6 +976,22 @@ func cosineSimilarity(a, b []float32) float32 {
 	}
 
 	return dot / (float32(math.Sqrt(float64(normA))) * float32(math.Sqrt(float64(normB))))
+}
+
+// cosineSimilarityOptimized calculates cosine similarity using pre-computed magnitudes
+// This avoids recomputing magnitudes for cached embeddings on every query
+func cosineSimilarityOptimized(a []float32, magA float32, b []float32, magB float32) float32 {
+	if len(a) != len(b) || len(a) == 0 || magA == 0 || magB == 0 {
+		return 0
+	}
+
+	// Only compute dot product - magnitudes are pre-computed
+	var dot float32
+	for i := range a {
+		dot += a[i] * b[i]
+	}
+
+	return dot / (magA * magB)
 }
 
 // getEmbeddingFromRecord extracts the embedding vector from a record's JSON field

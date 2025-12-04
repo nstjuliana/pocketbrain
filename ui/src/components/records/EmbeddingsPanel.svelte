@@ -12,7 +12,9 @@
     export let collection;
 
     let panel;
+    let embeddingMode = "field"; // "field" or "record"
     let selectedField = "";
+    let customTemplate = "";
     let isGenerating = false;
     let result = null;
     let stats = null;
@@ -23,26 +25,37 @@
         return (f.type === "text" || f.type === "editor") && f.embeddable;
     });
 
+    // Get all text/editor fields for record-level mode preview
+    $: textFields = (collection?.fields || []).filter((f) => {
+        return f.type === "text" || f.type === "editor" || f.type === "email" || f.type === "url";
+    });
+
     $: hasEmbeddableFields = embeddableFields.length > 0;
+
+    // Can always do record-level embedding if there are any text fields
+    $: canEmbedRecords = textFields.length > 0;
 
     // Auto-select first embeddable field
     $: if (embeddableFields.length > 0 && !selectedField) {
         selectedField = embeddableFields[0].name;
     }
 
-    // Load stats when field changes
-    $: if (selectedField && collection?.id) {
+    // Load stats when field or mode changes
+    $: if (collection?.id && (embeddingMode === "record" || selectedField)) {
         loadStats();
     }
 
     async function loadStats() {
-        if (!selectedField || !collection?.id) return;
+        if (!collection?.id) return;
+        
+        const fieldName = embeddingMode === "record" ? "_record" : selectedField;
+        if (!fieldName) return;
         
         isLoadingStats = true;
         stats = null;
         
         try {
-            stats = await ApiClient.send(`/api/ai/embedding-stats?collectionId=${collection.id}&fieldName=${selectedField}`, {
+            stats = await ApiClient.send(`/api/ai/embedding-stats?collectionId=${collection.id}&fieldName=${fieldName}`, {
                 method: "GET",
             });
         } catch (err) {
@@ -55,8 +68,10 @@
     export function show() {
         result = null;
         stats = null;
+        embeddingMode = "field";
         selectedField = embeddableFields.length > 0 ? embeddableFields[0].name : "";
-        if (selectedField) {
+        customTemplate = "";
+        if (selectedField || embeddingMode === "record") {
             loadStats();
         }
         return panel?.show();
@@ -67,18 +82,27 @@
     }
 
     async function generateEmbeddings() {
-        if (isGenerating || !collection?.id || !selectedField) return;
+        if (isGenerating || !collection?.id) return;
+        if (embeddingMode === "field" && !selectedField) return;
 
         isGenerating = true;
         result = null;
 
         try {
+            const body = {
+                collectionId: collection.id,
+                mode: embeddingMode,
+            };
+            
+            if (embeddingMode === "field") {
+                body.fieldName = selectedField;
+            } else if (customTemplate.trim()) {
+                body.template = customTemplate.trim();
+            }
+
             result = await ApiClient.send("/api/ai/generate-embeddings", {
                 method: "POST",
-                body: {
-                    collectionId: collection.id,
-                    fieldName: selectedField,
-                },
+                body,
             });
 
             if (result.generated > 0) {
@@ -103,6 +127,10 @@
         if (n === null || n === undefined || n === "" || isNaN(n)) return "0";
         return Number(n).toLocaleString();
     }
+
+    function getDefaultTemplate() {
+        return textFields.map(f => `{${f.name}}`).join("\n");
+    }
 </script>
 
 <OverlayPanel bind:this={panel} class="embeddings-panel overlay-panel-lg" popup on:hide on:show>
@@ -114,40 +142,122 @@
     </svelte:fragment>
 
     <div class="content">
-        {#if !hasEmbeddableFields}
+        {#if !hasEmbeddableFields && !canEmbedRecords}
             <div class="alert alert-warning">
                 <i class="ri-error-warning-line" />
                 <div>
-                    <strong>No embeddable fields found</strong>
+                    <strong>No text fields found</strong>
                     <p class="txt-sm m-t-5 m-b-0">
-                        To generate embeddings, first enable "Vector embeddings" on a text field in the collection schema.
+                        This collection has no text or editor fields to embed.
                     </p>
                 </div>
             </div>
         {:else}
             <p class="txt-hint m-b-base">
-                Generate vector embeddings for text fields in
+                Generate vector embeddings for
                 <strong>{collection?.name}</strong> to enable similarity search.
             </p>
 
-            <!-- Field Selection -->
-            <Field class="form-field m-b-base" name="field" let:uniqueId>
+            <!-- Mode Selection -->
+            <Field class="form-field m-b-base" name="mode" let:uniqueId>
                 <label for={uniqueId}>
-                    Select field
+                    Embedding mode
                     <i
                         class="ri-information-line link-hint"
                         use:tooltip={{
-                            text: "Choose which embeddable text field to generate embeddings for",
+                            text: "Field: Embed individual text fields separately. Record: Embed the entire record as one combined text.",
                             position: "top",
                         }}
                     />
                 </label>
-                <select id={uniqueId} bind:value={selectedField} disabled={isGenerating}>
-                    {#each embeddableFields as field}
-                        <option value={field.name}>{field.name}</option>
-                    {/each}
-                </select>
+                <div class="mode-selector">
+                    <button 
+                        type="button" 
+                        class="mode-btn" 
+                        class:active={embeddingMode === "field"}
+                        disabled={isGenerating || !hasEmbeddableFields}
+                        on:click={() => embeddingMode = "field"}
+                    >
+                        <i class="ri-text-spacing" />
+                        <span>Field-level</span>
+                    </button>
+                    <button 
+                        type="button" 
+                        class="mode-btn" 
+                        class:active={embeddingMode === "record"}
+                        disabled={isGenerating || !canEmbedRecords}
+                        on:click={() => embeddingMode = "record"}
+                    >
+                        <i class="ri-file-list-3-line" />
+                        <span>Entire record</span>
+                    </button>
+                </div>
             </Field>
+
+            {#if embeddingMode === "field"}
+                <!-- Field Selection -->
+                {#if hasEmbeddableFields}
+                    <Field class="form-field m-b-base" name="field" let:uniqueId>
+                        <label for={uniqueId}>
+                            Select field
+                            <i
+                                class="ri-information-line link-hint"
+                                use:tooltip={{
+                                    text: "Choose which embeddable text field to generate embeddings for",
+                                    position: "top",
+                                }}
+                            />
+                        </label>
+                        <select id={uniqueId} bind:value={selectedField} disabled={isGenerating}>
+                            {#each embeddableFields as field}
+                                <option value={field.name}>{field.name}</option>
+                            {/each}
+                        </select>
+                    </Field>
+                {:else}
+                    <div class="alert alert-warning m-b-base">
+                        <i class="ri-error-warning-line" />
+                        <div>
+                            <strong>No embeddable fields</strong>
+                            <p class="txt-sm m-t-5 m-b-0">
+                                Enable "Vector embeddings" on text fields in the schema, or use "Entire record" mode.
+                            </p>
+                        </div>
+                    </div>
+                {/if}
+            {:else}
+                <!-- Record-level options -->
+                <div class="record-mode-info m-b-base">
+                    <p class="txt-hint txt-sm m-b-sm">
+                        <i class="ri-information-line" />
+                        All text fields will be combined into a single embedding per record.
+                    </p>
+                    <p class="txt-hint txt-sm">
+                        <strong>Fields included:</strong> {textFields.map(f => f.name).join(", ")}
+                    </p>
+                </div>
+
+                <!-- Optional custom template -->
+                <Field class="form-field m-b-base" name="template" let:uniqueId>
+                    <label for={uniqueId}>
+                        Custom template (optional)
+                        <i
+                            class="ri-information-line link-hint"
+                            use:tooltip={{
+                                text: "Use {fieldName} placeholders. Leave empty for default format.",
+                                position: "top",
+                            }}
+                        />
+                    </label>
+                    <textarea
+                        id={uniqueId}
+                        bind:value={customTemplate}
+                        placeholder={getDefaultTemplate()}
+                        rows="3"
+                        disabled={isGenerating}
+                    />
+                </Field>
+            {/if}
 
             <!-- Stats -->
             {#if stats}
@@ -233,12 +343,12 @@
         <button type="button" class="btn btn-transparent" disabled={isGenerating} on:click={() => hide()}>
             <span class="txt">Close</span>
         </button>
-        {#if hasEmbeddableFields}
+        {#if (embeddingMode === "field" && hasEmbeddableFields) || (embeddingMode === "record" && canEmbedRecords)}
             <button
                 type="button"
                 class="btn btn-expanded"
                 class:btn-loading={isGenerating}
-                disabled={isGenerating || !selectedField}
+                disabled={isGenerating || (embeddingMode === "field" && !selectedField)}
                 on:click={() => generateEmbeddings()}
             >
                 <i class="ri-bubble-chart-line" aria-hidden="true" />
@@ -391,6 +501,73 @@
     .error-details ul {
         margin: 0;
         padding-left: 20px;
+    }
+
+    /* Mode selector */
+    .mode-selector {
+        display: flex;
+        gap: 8px;
+    }
+
+    .mode-btn {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 12px 16px;
+        border: 2px solid var(--baseAlt2Color);
+        border-radius: var(--baseRadius);
+        background: var(--baseColor);
+        color: var(--txtHintColor);
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .mode-btn:hover:not(:disabled) {
+        border-color: var(--primaryColor);
+        color: var(--txtPrimaryColor);
+    }
+
+    .mode-btn.active {
+        border-color: var(--primaryColor);
+        background: var(--primaryAltColor);
+        color: var(--primaryColor);
+    }
+
+    .mode-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    .mode-btn i {
+        font-size: 1.2em;
+    }
+
+    /* Record mode info */
+    .record-mode-info {
+        background: var(--baseAlt1Color);
+        border-radius: var(--baseRadius);
+        padding: 12px;
+    }
+
+    .record-mode-info p {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+        margin: 0;
+    }
+
+    .record-mode-info i {
+        flex-shrink: 0;
+        margin-top: 2px;
+    }
+
+    textarea {
+        resize: vertical;
+        min-height: 60px;
+        font-family: monospace;
+        font-size: 0.9em;
     }
 </style>
 

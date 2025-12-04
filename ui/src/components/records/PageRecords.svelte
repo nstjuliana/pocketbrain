@@ -42,6 +42,11 @@
     $: hasEmbeddableFields = ($activeCollection?.fields || []).some(
         (f) => (f.type === "text" || f.type === "editor") && f.embeddable
     );
+    
+    // Check if collection has any text fields (for record-level embedding)
+    $: hasTextFields = ($activeCollection?.fields || []).some(
+        (f) => f.type === "text" || f.type === "editor" || f.type === "email" || f.type === "url"
+    );
     let sort = initialQueryParams.get("sort") || "-@rowid";
     let selectedCollectionIdOrName = initialQueryParams.get("collection") || $activeCollection?.id;
     let totalCount = 0; // used to manully change the count without the need of reloading the recordsCount component
@@ -230,7 +235,7 @@
                         <span class="txt">Generate Data</span>
                     </button>
 
-                    {#if hasEmbeddableFields}
+                    {#if hasEmbeddableFields || hasTextFields}
                         <button
                             type="button"
                             class="btn btn-outline"
@@ -362,4 +367,10 @@
 <SimilaritySearchPanel
     bind:this={similaritySearchPanel}
     collection={$activeCollection}
+    on:viewRecord={(e) => {
+        // Open the record in the editor
+        $activeCollection?.type === "view"
+            ? recordPreviewPanel?.show(e.detail.recordId)
+            : recordUpsertPanel?.show(e.detail.recordId);
+    }}
 />

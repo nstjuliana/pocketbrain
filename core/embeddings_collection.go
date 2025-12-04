@@ -133,6 +133,9 @@ func DeleteEmbeddingsForCollection(app App, collectionId string) error {
 		}
 	}
 
+	// Invalidate cache for this collection
+	embeddingCache.InvalidateCollection(collectionId)
+
 	return nil
 }
 
@@ -164,6 +167,9 @@ func DeleteEmbeddingsForField(app App, collectionId, fieldName string) error {
 			return fmt.Errorf("failed to delete embedding: %w", err)
 		}
 	}
+
+	// Invalidate cache for this collection/field
+	embeddingCache.Invalidate(collectionId, fieldName)
 
 	return nil
 }
