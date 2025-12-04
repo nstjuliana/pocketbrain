@@ -161,6 +161,20 @@ pb.ai = {
             ...options,
         });
     },
+
+    /**
+     * Generate seed data for a collection using AI
+     * @param {Object} data - Request data with collectionId, count, and optional description
+     * @param {Object} [options] - Request options
+     * @returns {Promise<Object>} - Response with created/skipped counts
+     */
+    generateSeedData: async function (data, options = {}) {
+        return pb.send("/api/ai/generate-seed-data", {
+            method: "POST",
+            body: data,
+            ...options,
+        });
+    },
 };
 
 if (pb.authStore.isValid) {

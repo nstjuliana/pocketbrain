@@ -13,6 +13,7 @@
     import RecordUpsertPanel from "@/components/records/RecordUpsertPanel.svelte";
     import RecordsCount from "@/components/records/RecordsCount.svelte";
     import RecordsList from "@/components/records/RecordsList.svelte";
+    import SeedDataPanel from "@/components/records/SeedDataPanel.svelte";
     import { hideControls, pageTitle } from "@/stores/app";
     import {
         activeCollection,
@@ -30,6 +31,7 @@
     let recordPreviewPanel;
     let recordsList;
     let recordsCount;
+    let seedDataPanel;
     let filter = initialQueryParams.get("filter") || "";
     let sort = initialQueryParams.get("sort") || "-@rowid";
     let selectedCollectionIdOrName = initialQueryParams.get("collection") || $activeCollection?.id;
@@ -209,6 +211,16 @@
                 </button>
 
                 {#if $activeCollection.type !== "view"}
+                    <button
+                        type="button"
+                        class="btn btn-outline"
+                        use:tooltip={{ text: "Generate sample records using AI", position: "bottom" }}
+                        on:click={() => seedDataPanel?.show()}
+                    >
+                        <i class="ri-seedling-line" />
+                        <span class="txt">Generate Data</span>
+                    </button>
+
                     <button type="button" class="btn btn-expanded" on:click={() => recordUpsertPanel?.show()}>
                         <i class="ri-add-line" />
                         <span class="txt">New record</span>
@@ -300,5 +312,14 @@
     collection={$activeCollection}
     on:hide={() => {
         updateQueryParams({ recordId: null });
+    }}
+/>
+
+<SeedDataPanel
+    bind:this={seedDataPanel}
+    collection={$activeCollection}
+    on:generated={() => {
+        recordsList?.load();
+        recordsCount?.reload();
     }}
 />

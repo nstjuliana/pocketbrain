@@ -2,10 +2,12 @@ package apis
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/forms"
 	"github.com/pocketbase/pocketbase/tools/router"
 )
 
@@ -14,6 +16,7 @@ func bindAIApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
 	subGroup := rg.Group("/ai").Bind(RequireSuperuserAuth())
 	subGroup.POST("/generate-schema", aiGenerateSchema)
 	subGroup.POST("/test-connection", aiTestConnection)
+	subGroup.POST("/generate-seed-data", aiGenerateSeedData)
 }
 
 func aiGenerateSchema(e *core.RequestEvent) error {
@@ -85,5 +88,111 @@ func aiTestConnection(e *core.RequestEvent) error {
 		"success": true,
 		"message": "Connection successful",
 	})
+}
+
+// aiGenerateSeedData generates sample records for a collection using AI.
+// For counts <= 20: Uses pure AI generation
+// For counts > 20: Uses hybrid AI archetypes + gofakeit multiplexing for speed
+func aiGenerateSeedData(e *core.RequestEvent) error {
+	var req struct {
+		CollectionId string `json:"collectionId"`
+		Count        int    `json:"count"`
+		Description  string `json:"description"`
+	}
+
+	if err := e.BindBody(&req); err != nil {
+		return e.BadRequestError("Failed to load the submitted data due to invalid formatting.", err)
+	}
+
+	// Validate request - now supports up to 1,000,000 records
+	if err := validation.ValidateStruct(&req,
+		validation.Field(&req.CollectionId, validation.Required),
+		validation.Field(&req.Count, validation.Required, validation.Min(1), validation.Max(1000000)),
+	); err != nil {
+		return e.BadRequestError("Invalid request data.", err)
+	}
+
+	// Find the collection
+	collection, err := e.App.FindCollectionByNameOrId(req.CollectionId)
+	if err != nil {
+		return e.NotFoundError("Collection not found.", err)
+	}
+
+	// Don't allow seed data for view collections
+	if collection.IsView() {
+		return e.BadRequestError("Cannot generate seed data for view collections.", nil)
+	}
+
+	// Generate seed data using hybrid AI service (auto-switches based on count)
+	records, err := core.GenerateSeedDataHybrid(e.App, collection, req.Count, req.Description)
+	if err != nil {
+		return e.BadRequestError("Failed to generate seed data: "+err.Error(), nil)
+	}
+
+	// Determine which mode was used
+	mode := "pure_ai"
+	if req.Count > core.HybridThreshold {
+		mode = "hybrid"
+	}
+
+	// Create the records in the database using transaction for better performance
+	created := 0
+	skipped := 0
+	var creationErrors []string
+
+	// Use batched transaction for large counts
+	batchSize := 100
+	if req.Count > 1000 {
+		batchSize = 500
+	}
+
+	for i := 0; i < len(records); i += batchSize {
+		end := i + batchSize
+		if end > len(records) {
+			end = len(records)
+		}
+		batch := records[i:end]
+
+		err := e.App.RunInTransaction(func(txApp core.App) error {
+			for j, recordData := range batch {
+				record := core.NewRecord(collection)
+				form := forms.NewRecordUpsert(txApp, record)
+				form.GrantSuperuserAccess()
+				form.Load(recordData)
+
+				if err := form.Submit(); err != nil {
+					skipped++
+					if len(creationErrors) < 10 {
+						creationErrors = append(creationErrors,
+							fmt.Sprintf("Record %d: %s", i+j+1, err.Error()))
+					}
+					continue
+				}
+				created++
+			}
+			return nil
+		})
+
+		if err != nil {
+			// Log transaction error but continue with other batches
+			creationErrors = append(creationErrors,
+				fmt.Sprintf("Batch %d-%d transaction error: %s", i+1, end, err.Error()))
+		}
+	}
+
+	response := map[string]interface{}{
+		"created": created,
+		"skipped": skipped,
+		"total":   len(records),
+		"mode":    mode,
+	}
+
+	if len(creationErrors) > 0 && len(creationErrors) <= 5 {
+		response["errors"] = creationErrors
+	} else if len(creationErrors) > 5 {
+		response["errors"] = append(creationErrors[:5], fmt.Sprintf("... and %d more", len(creationErrors)-5))
+	}
+
+	return e.JSON(http.StatusOK, response)
 }
 

@@ -1,11 +1,11 @@
 <script>
     import { createEventDispatcher, tick } from "svelte";
-    import { scale } from "svelte/transition";
+    import { scale, slide } from "svelte/transition";
     import ApiClient from "@/utils/ApiClient";
     import CommonHelper from "@/utils/CommonHelper";
     import { confirm } from "@/stores/confirmation";
     import { errors, removeError, setErrors } from "@/stores/errors";
-    import { addSuccessToast, removeAllToasts } from "@/stores/toasts";
+    import { addSuccessToast, addInfoToast, removeAllToasts } from "@/stores/toasts";
     import {
         addCollection,
         removeCollection,
@@ -24,7 +24,8 @@
     import CollectionUpdateConfirm from "@/components/collections/CollectionUpdateConfirm.svelte";
     import SchemaChat from "@/components/collections/SchemaChat.svelte";
 
-    const TAB_SCHEMA = "schema";
+    const TAB_FIELDS = "fields";
+    const TAB_AI = "ai_assistant";
     const TAB_RULES = "api_rules";
     const TAB_OPTIONS = "options";
 
@@ -37,6 +38,16 @@
     collectionTypes[TYPE_VIEW] = "View";
     collectionTypes[TYPE_AUTH] = "Auth";
 
+    // Auto-seed presets
+    const seedPresets = [
+        { value: 0, label: "None" },
+        { value: 10, label: "10" },
+        { value: 100, label: "100" },
+        { value: 1000, label: "1K" },
+        { value: 10000, label: "10K" },
+        { value: 100000, label: "100K" },
+    ];
+
     const dispatch = createEventDispatcher();
 
     let collectionPanel;
@@ -46,11 +57,15 @@
     let isSaving = false;
     let isLoadingConfirmation = false;
     let confirmClose = false; // prevent close recursion
-    let activeTab = TAB_SCHEMA;
+    let activeTab = TAB_FIELDS;
     let initialFormHash = calculateFormHash(collection);
     let fieldsTabError = "";
     let baseCollectionKeys = [];
-    let useAISchema = false;
+
+    // Auto-seed options for new collections
+    let autoSeedCount = 0;
+    let autoSeedDescription = "";
+    let isSeedingAfterCreate = false;
 
     $: baseCollectionKeys = Object.keys($scaffolds["base"] || {});
 
@@ -75,7 +90,7 @@
 
     $: if (activeTab === TAB_OPTIONS && collection.type !== "auth") {
         // reset selected tab
-        changeTab(TAB_SCHEMA);
+        changeTab(TAB_FIELDS);
     }
 
     $: if (collection.type === "view") {
@@ -104,7 +119,7 @@
         isLoadingConfirmation = false;
         isSaving = false;
 
-        changeTab(TAB_SCHEMA);
+        changeTab(TAB_FIELDS);
 
         return collectionPanel?.show();
     }
@@ -120,6 +135,11 @@
 
     async function load(model) {
         setErrors({}); // reset errors
+
+        // Reset auto-seed options
+        autoSeedCount = 0;
+        autoSeedDescription = "";
+        isSeedingAfterCreate = false;
 
         if (typeof model !== "undefined") {
             original = model;
@@ -178,6 +198,7 @@
 
         const data = exportFormData();
         const isNew = !collection.id;
+        const shouldAutoSeed = isNew && autoSeedCount > 0 && !isView;
 
         try {
             let result;
@@ -190,13 +211,6 @@
             removeAllToasts();
 
             addCollection(result);
-
-            if (hideAfterSave) {
-                confirmClose = false;
-                hide();
-            } else {
-                load(result);
-            }
 
             addSuccessToast(
                 !collection.id ? "Successfully created collection." : "Successfully updated collection.",
@@ -211,12 +225,50 @@
                 $activeCollection = result;
 
                 await refreshScaffolds();
+
+                // Auto-seed if requested
+                if (shouldAutoSeed) {
+                    await performAutoSeed(result);
+                }
+            }
+
+            if (hideAfterSave) {
+                confirmClose = false;
+                hide();
+            } else {
+                load(result);
             }
         } catch (err) {
             ApiClient.error(err);
         }
 
         isSaving = false;
+    }
+
+    async function performAutoSeed(createdCollection) {
+        isSeedingAfterCreate = true;
+        addInfoToast(`Seeding ${(autoSeedCount || 0).toLocaleString()} records...`);
+
+        try {
+            const seedResult = await ApiClient.ai.generateSeedData({
+                collectionId: createdCollection.id,
+                count: autoSeedCount,
+                description: autoSeedDescription || undefined,
+            });
+
+            if (seedResult.created > 0) {
+                addSuccessToast(
+                    `Auto-seeded ${seedResult.created.toLocaleString()} record${seedResult.created !== 1 ? "s" : ""}` +
+                    (seedResult.mode === "hybrid" ? " (fast mode)" : "")
+                );
+                dispatch("seeded", seedResult);
+            }
+        } catch (err) {
+            ApiClient.error(err, false);
+            addInfoToast("Collection created, but auto-seed failed: " + (err?.data?.message || err?.message));
+        }
+
+        isSeedingAfterCreate = false;
     }
 
     function exportFormData() {
@@ -354,7 +406,7 @@
 <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
 <OverlayPanel
     bind:this={collectionPanel}
-    class="overlay-panel-lg colored-header collection-panel"
+    class="overlay-panel-lg colored-header collection-panel compact-header"
     escClose={false}
     overlayClose={!isSaving}
     beforeHide={() => {
@@ -371,142 +423,156 @@
     on:show
 >
     <svelte:fragment slot="header">
-        <h4 class="upsert-panel-title">
-            {!collection.id ? "New collection" : "Edit collection"}
-        </h4>
-
-        {#if !!collection.id && (!collection.system || !isView)}
-            <div class="flex-fill" />
-            <div
-                tabindex="0"
-                role="button"
-                aria-label="More collection options"
-                class="btn btn-sm btn-circle btn-transparent flex-gap-0"
+        <!-- Compact header row: Name input + Type selector + Options menu -->
+        <div class="compact-header-row">
+            <form
+                class="name-form"
+                on:submit|preventDefault={() => {
+                    canSave && saveConfirm();
+                }}
             >
-                <i class="ri-more-line" aria-hidden="true" />
-                <Toggler class="dropdown dropdown-right m-t-5">
-                    {#if !collection.system}
-                        <button
-                            type="button"
-                            class="dropdown-item"
-                            role="menuitem"
-                            on:click={() => duplicateConfirm()}
-                        >
-                            <i class="ri-file-copy-line" aria-hidden="true" />
-                            <span class="txt">Duplicate</span>
-                        </button>
-                        <hr />
-                    {/if}
-                    {#if !isView}
-                        <button
-                            type="button"
-                            class="dropdown-item txt-danger"
-                            role="menuitem"
-                            on:click={() => truncateConfirm()}
-                        >
-                            <i class="ri-eraser-line" aria-hidden="true"></i>
-                            <span class="txt">Truncate</span>
-                        </button>
-                    {/if}
-                    {#if !collection.system}
-                        <button
-                            type="button"
-                            class="dropdown-item txt-danger"
-                            role="menuitem"
-                            on:click|preventDefault|stopPropagation={() => deleteConfirm()}
-                        >
-                            <i class="ri-delete-bin-7-line" aria-hidden="true" />
-                            <span class="txt">Delete</span>
-                        </button>
-                    {/if}
-                </Toggler>
-            </div>
-        {/if}
-
-        <form
-            class="block"
-            on:submit|preventDefault={() => {
-                canSave && saveConfirm();
-            }}
-        >
-            <Field class="form-field collection-field-name required m-b-0" name="name" let:uniqueId>
-                <label for={uniqueId}>Name</label>
-
                 <!-- svelte-ignore a11y-autofocus -->
                 <input
                     type="text"
-                    id={uniqueId}
+                    class="name-input"
                     required
                     disabled={isSystemUpdate}
                     spellcheck="false"
                     class:txt-bold={collection.system}
                     autofocus={!collection.id}
-                    placeholder={isAuth ? `eg. "users"` : `eg. "posts"`}
+                    placeholder={!collection.id ? "collection_name" : ""}
                     value={collection.name}
                     on:input={(e) => {
                         collection.name = CommonHelper.slugify(e.target.value);
                         e.target.value = collection.name;
                     }}
                 />
+                <input type="submit" class="hidden" tabindex="-1" />
+            </form>
 
-                <div class="form-field-addon">
-                    <div
-                        tabindex={!collection.id ? 0 : -1}
-                        role={!collection.id ? "button" : ""}
-                        aria-label="View types"
-                        class="btn btn-sm p-r-10 p-l-10 {!collection.id ? 'btn-outline' : 'btn-transparent'}"
-                        class:btn-disabled={!!collection.id}
-                    >
-                        <!-- empty span for alignment -->
-                        <span aria-hidden="true" />
-                        <span class="txt">Type: {collectionTypes[collection.type] || "N/A"}</span>
-                        {#if !collection.id}
-                            <i class="ri-arrow-down-s-fill" aria-hidden="true" />
-                            <Toggler class="dropdown dropdown-right dropdown-nowrap m-t-5">
-                                {#each Object.entries(collectionTypes) as [type, label]}
-                                    <button
-                                        type="button"
-                                        role="menuitem"
-                                        class="dropdown-item closable"
-                                        class:selected={type == collection.type}
-                                        on:click={() => setCollectionType(type)}
-                                    >
-                                        <i
-                                            class={CommonHelper.getCollectionTypeIcon(type)}
-                                            aria-hidden="true"
-                                        />
-                                        <span class="txt">{label} collection</span>
-                                    </button>
-                                {/each}
-                            </Toggler>
-                        {/if}
-                    </div>
-                </div>
-
-                {#if collection.system}
-                    <div class="help-block">System collection</div>
-                {/if}
-            </Field>
-
-            <input type="submit" class="hidden" tabindex="-1" />
-        </form>
-
-        <div class="tabs-header stretched">
-            <button
-                type="button"
-                class="tab-item"
-                class:active={activeTab === TAB_SCHEMA}
-                on:click={() => changeTab(TAB_SCHEMA)}
+            <div
+                tabindex={!collection.id ? 0 : -1}
+                role={!collection.id ? "button" : ""}
+                aria-label="View types"
+                class="type-selector"
+                class:clickable={!collection.id}
             >
-                <span class="txt">{isView ? "Query" : "Fields"}</span>
-                {#if !CommonHelper.isEmpty(fieldsTabError)}
-                    <i
-                        class="ri-error-warning-fill txt-danger"
-                        transition:scale={{ duration: 150, start: 0.7 }}
-                        use:tooltip={fieldsTabError}
-                    />
+                <span class="type-label">{collectionTypes[collection.type] || "N/A"}</span>
+                {#if !collection.id}
+                    <i class="ri-arrow-down-s-fill" aria-hidden="true" />
+                    <Toggler class="dropdown dropdown-right dropdown-nowrap m-t-5">
+                        {#each Object.entries(collectionTypes) as [type, label]}
+                            <button
+                                type="button"
+                                role="menuitem"
+                                class="dropdown-item closable"
+                                class:selected={type == collection.type}
+                                on:click={() => setCollectionType(type)}
+                            >
+                                <i
+                                    class={CommonHelper.getCollectionTypeIcon(type)}
+                                    aria-hidden="true"
+                                />
+                                <span class="txt">{label}</span>
+                            </button>
+                        {/each}
+                    </Toggler>
                 {/if}
-            </button>
+            </div>
+
+            {#if !!collection.id && (!collection.system || !isView)}
+                <div
+                    tabindex="0"
+                    role="button"
+                    aria-label="More collection options"
+                    class="btn btn-sm btn-circle btn-transparent flex-gap-0"
+                >
+                    <i class="ri-more-line" aria-hidden="true" />
+                    <Toggler class="dropdown dropdown-right m-t-5">
+                        {#if !collection.system}
+                            <button
+                                type="button"
+                                class="dropdown-item"
+                                role="menuitem"
+                                on:click={() => duplicateConfirm()}
+                            >
+                                <i class="ri-file-copy-line" aria-hidden="true" />
+                                <span class="txt">Duplicate</span>
+                            </button>
+                            <hr />
+                        {/if}
+                        {#if !isView}
+                            <button
+                                type="button"
+                                class="dropdown-item txt-danger"
+                                role="menuitem"
+                                on:click={() => truncateConfirm()}
+                            >
+                                <i class="ri-eraser-line" aria-hidden="true"></i>
+                                <span class="txt">Truncate</span>
+                            </button>
+                        {/if}
+                        {#if !collection.system}
+                            <button
+                                type="button"
+                                class="dropdown-item txt-danger"
+                                role="menuitem"
+                                on:click|preventDefault|stopPropagation={() => deleteConfirm()}
+                            >
+                                <i class="ri-delete-bin-7-line" aria-hidden="true" />
+                                <span class="txt">Delete</span>
+                            </button>
+                        {/if}
+                    </Toggler>
+                </div>
+            {/if}
+        </div>
+
+        <!-- Compact tabs -->
+        <div class="tabs-header compact-tabs">
+            {#if isView}
+                <button
+                    type="button"
+                    class="tab-item"
+                    class:active={activeTab === TAB_FIELDS}
+                    on:click={() => changeTab(TAB_FIELDS)}
+                >
+                    <span class="txt">Query</span>
+                    {#if !CommonHelper.isEmpty(fieldsTabError)}
+                        <i
+                            class="ri-error-warning-fill txt-danger"
+                            transition:scale={{ duration: 150, start: 0.7 }}
+                            use:tooltip={fieldsTabError}
+                        />
+                    {/if}
+                </button>
+            {:else}
+                <button
+                    type="button"
+                    class="tab-item"
+                    class:active={activeTab === TAB_FIELDS}
+                    on:click={() => changeTab(TAB_FIELDS)}
+                >
+                    <i class="ri-list-check" aria-hidden="true" />
+                    <span class="txt">Fields</span>
+                    {#if !CommonHelper.isEmpty(fieldsTabError)}
+                        <i
+                            class="ri-error-warning-fill txt-danger"
+                            transition:scale={{ duration: 150, start: 0.7 }}
+                            use:tooltip={fieldsTabError}
+                        />
+                    {/if}
+                </button>
+                <button
+                    type="button"
+                    class="tab-item ai-tab"
+                    class:active={activeTab === TAB_AI}
+                    on:click={() => changeTab(TAB_AI)}
+                >
+                    <i class="ri-robot-line" aria-hidden="true" />
+                    <span class="txt">AI Assistant</span>
+                </button>
+            {/if}
 
             {#if !isSuperusers}
                 <button
@@ -546,99 +612,119 @@
         </div>
     </svelte:fragment>
 
-    <div class="tabs-content">
-        <!-- avoid rerendering the fields tab -->
-        <div class="tab-item" class:active={activeTab === TAB_SCHEMA}>
-            {#if isView}
-                <CollectionQueryTab bind:collection />
-            {:else}
-                <div class="schema-tab-container">
-                    <div class="schema-mode-toggle">
-                        <button
-                            type="button"
-                            class="btn btn-sm"
-                            class:btn-outline={!useAISchema}
-                            class:btn-transparent={useAISchema}
-                            on:click={() => (useAISchema = false)}
-                        >
-                            <i class="ri-edit-line" aria-hidden="true" />
-                            <span class="txt">Manual</span>
-                        </button>
-                        <button
-                            type="button"
-                            class="btn btn-sm"
-                            class:btn-outline={useAISchema}
-                            class:btn-transparent={!useAISchema}
-                            on:click={() => (useAISchema = true)}
-                        >
-                            <i class="ri-robot-line" aria-hidden="true" />
-                            <span class="txt">AI Assistant</span>
-                        </button>
-                    </div>
+    <div class="tabs-content full-height">
+        <!-- Fields tab (or Query for views) -->
+        {#if activeTab === TAB_FIELDS}
+            <div class="tab-item active">
+                {#if isView}
+                    <CollectionQueryTab bind:collection />
+                {:else}
+                    <CollectionFieldsTab bind:collection />
+                {/if}
+            </div>
+        {/if}
 
-                    <!-- Keep both mounted to preserve state when switching -->
-                    <div class:hidden={useAISchema}>
-                        <CollectionFieldsTab bind:collection />
-                    </div>
-                    <div class:hidden={!useAISchema}>
-                        <SchemaChat bind:collection on:applied={() => {}} />
-                    </div>
-                </div>
-            {/if}
-        </div>
+        <!-- AI Assistant tab (only for non-view collections) -->
+        {#if !isView && activeTab === TAB_AI}
+            <div class="tab-item active ai-tab-content">
+                <SchemaChat bind:collection on:applied={() => changeTab(TAB_FIELDS)} />
+            </div>
+        {/if}
 
+        <!-- API Rules tab -->
         {#if !isSuperusers && activeTab === TAB_RULES}
             <div class="tab-item active">
                 <CollectionRulesTab bind:collection />
             </div>
         {/if}
 
-        {#if isAuth}
-            <div class="tab-item" class:active={activeTab === TAB_OPTIONS}>
+        <!-- Options tab (auth collections only) -->
+        {#if isAuth && activeTab === TAB_OPTIONS}
+            <div class="tab-item active">
                 <CollectionAuthOptionsTab bind:collection />
             </div>
         {/if}
     </div>
 
     <svelte:fragment slot="footer">
-        <button type="button" class="btn btn-transparent" disabled={isSaving} on:click={() => hide()}>
-            <span class="txt">Cancel</span>
-        </button>
+        <!-- Auto-seed option for new non-view collections -->
+        {#if !collection.id && !isView}
+            <div class="auto-seed-section" transition:slide={{ duration: 150 }}>
+                <div class="auto-seed-toggle">
+                    <i class="ri-seedling-line" aria-hidden="true" />
+                    <span class="auto-seed-label">Auto-seed:</span>
+                    <div class="seed-presets">
+                        {#each seedPresets as preset}
+                            <button
+                                type="button"
+                                class="preset-chip"
+                                class:active={autoSeedCount === preset.value}
+                                on:click={() => (autoSeedCount = preset.value)}
+                                disabled={isSaving}
+                            >
+                                {preset.label}
+                            </button>
+                        {/each}
+                    </div>
+                    {#if autoSeedCount > 0}
+                        <input
+                            type="text"
+                            class="seed-description-input"
+                            placeholder="Data context (optional)..."
+                            bind:value={autoSeedDescription}
+                            disabled={isSaving}
+                        />
+                    {/if}
+                </div>
+            </div>
+        {/if}
 
-        <div class="btns-group no-gap">
-            <button
-                type="button"
-                title="Save and close"
-                class="btn"
-                class:btn-expanded={!collection.id}
-                class:btn-expanded-sm={!!collection.id}
-                class:btn-loading={isSaving || isLoadingConfirmation}
-                disabled={!canSave || isSaving || isLoadingConfirmation}
-                on:click={() => saveConfirm()}
-            >
-                <span class="txt">{!collection.id ? "Create" : "Save changes"}</span>
+        <div class="footer-buttons">
+            <button type="button" class="btn btn-transparent" disabled={isSaving} on:click={() => hide()}>
+                <span class="txt">Cancel</span>
             </button>
 
-            {#if collection.id}
+            <div class="btns-group no-gap">
                 <button
                     type="button"
-                    class="btn p-l-5 p-r-5 flex-gap-0"
+                    title="Save and close"
+                    class="btn"
+                    class:btn-expanded={!collection.id}
+                    class:btn-expanded-sm={!!collection.id}
+                    class:btn-loading={isSaving || isLoadingConfirmation || isSeedingAfterCreate}
+                    class:btn-success={!collection.id && autoSeedCount > 0}
                     disabled={!canSave || isSaving || isLoadingConfirmation}
+                    on:click={() => saveConfirm()}
                 >
-                    <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
-
-                    <Toggler class="dropdown dropdown-upside dropdown-right dropdown-nowrap m-b-5">
-                        <button
-                            type="button"
-                            class="dropdown-item closable"
-                            role="menuitem"
-                            on:click={() => saveConfirm(false)}
-                        >
-                            <span class="txt">Save and continue</span>
-                        </button>
-                    </Toggler>
+                    {#if !collection.id && autoSeedCount > 0}
+                        <i class="ri-seedling-line" aria-hidden="true" />
+                        <span class="txt">Create + Seed {(autoSeedCount || 0).toLocaleString()}</span>
+                    {:else}
+                        <span class="txt">{!collection.id ? "Create" : "Save changes"}</span>
+                    {/if}
                 </button>
-            {/if}
+
+                {#if collection.id}
+                    <button
+                        type="button"
+                        class="btn p-l-5 p-r-5 flex-gap-0"
+                        disabled={!canSave || isSaving || isLoadingConfirmation}
+                    >
+                        <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
+
+                        <Toggler class="dropdown dropdown-upside dropdown-right dropdown-nowrap m-b-5">
+                            <button
+                                type="button"
+                                class="dropdown-item closable"
+                                role="menuitem"
+                                on:click={() => saveConfirm(false)}
+                            >
+                                <span class="txt">Save and continue</span>
+                            </button>
+                        </Toggler>
+                    </button>
+                {/if}
+            </div>
         </div>
     </svelte:fragment>
 </OverlayPanel>
@@ -646,30 +732,242 @@
 <CollectionUpdateConfirm bind:this={confirmChangesPanel} on:confirm={(e) => save(e.detail)} />
 
 <style>
-    .upsert-panel-title {
+    /* Compact header styles */
+    :global(.compact-header .panel-header) {
+        padding: 12px 20px 0 20px !important;
+        gap: 8px !important;
+    }
+
+    .compact-header-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+    }
+
+    .name-form {
+        flex: 1;
+        min-width: 0;
+    }
+
+    .name-input {
+        width: 100%;
+        padding: 8px 12px;
+        border: 1px solid var(--borderColor);
+        border-radius: var(--baseRadius);
+        font-size: 1.1em;
+        font-weight: 600;
+        background: var(--baseAlt1Color);
+        color: var(--txtPrimaryColor);
+    }
+
+    .name-input:focus {
+        outline: none;
+        border-color: var(--primaryColor);
+        background: var(--baseColor);
+    }
+
+    .name-input::placeholder {
+        font-weight: normal;
+        opacity: 0.5;
+    }
+
+    .type-selector {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 8px 12px;
+        background: var(--baseAlt2Color);
+        border-radius: var(--baseRadius);
+        font-size: 0.85em;
+        font-weight: 500;
+        color: var(--txtHintColor);
+        white-space: nowrap;
+    }
+
+    .type-selector.clickable {
+        cursor: pointer;
+    }
+
+    .type-selector.clickable:hover {
+        background: var(--baseAlt1Color);
+        color: var(--txtPrimaryColor);
+    }
+
+    .type-label {
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        font-size: 0.75em;
+    }
+
+    /* Compact tabs */
+    .compact-tabs {
+        margin-top: 8px !important;
+        padding-bottom: 0 !important;
+        border-bottom: none !important;
+        gap: 4px;
+    }
+
+    .compact-tabs .tab-item {
+        padding: 8px 14px !important;
+        font-size: 0.85em !important;
         display: inline-flex;
         align-items: center;
-        min-height: var(--smBtnHeight);
+        gap: 6px;
     }
+
+    .compact-tabs .tab-item i {
+        font-size: 1.1em;
+    }
+
     .tabs-content:focus-within {
         z-index: 9; /* autocomplete dropdown overlay fix */
     }
+
     :global(.collection-panel .panel-content) {
         scrollbar-gutter: stable;
         padding-right: calc(var(--baseSpacing) - 5px);
     }
 
-    .schema-tab-container {
+    /* Full height tabs content */
+    :global(.collection-panel .panel-content) {
         display: flex;
         flex-direction: column;
-        height: 100%;
     }
 
-    .schema-mode-toggle {
+    .full-height {
+        flex: 1;
+        min-height: 0;
         display: flex;
-        gap: var(--baseSpacing);
-        margin-bottom: var(--baseSpacing);
-        padding-bottom: var(--baseSpacing);
-        border-bottom: 1px solid var(--borderColor);
+        flex-direction: column;
+    }
+
+    .full-height > .tab-item {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: auto;
+    }
+
+    /* AI tab styling */
+    .ai-tab {
+        color: var(--successColor) !important;
+    }
+
+    .ai-tab.active {
+        border-color: var(--successColor) !important;
+    }
+
+    .ai-tab i {
+        color: var(--successColor);
+    }
+
+    .ai-tab-content {
+        overflow: hidden !important;
+    }
+
+    .ai-tab-content:not(.active) {
+        display: none !important;
+    }
+
+    /* Auto-seed section in footer */
+    :global(.collection-panel .panel-footer) {
+        flex-direction: column !important;
+        gap: 12px !important;
+    }
+
+    .auto-seed-section {
+        width: 100%;
+        padding: 12px;
+        background: var(--baseAlt1Color);
+        border-radius: var(--baseRadius);
+        margin-bottom: 4px;
+    }
+
+    .auto-seed-toggle {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+
+    .auto-seed-toggle > i {
+        color: var(--successColor);
+        font-size: 1.1em;
+    }
+
+    .auto-seed-label {
+        font-weight: 600;
+        font-size: 0.9em;
+        white-space: nowrap;
+    }
+
+    .seed-presets {
+        display: flex;
+        gap: 4px;
+        flex-wrap: wrap;
+    }
+
+    .preset-chip {
+        padding: 4px 10px;
+        border: 1px solid var(--borderColor);
+        border-radius: 14px;
+        background: var(--baseColor);
+        color: var(--txtPrimaryColor);
+        font-size: 0.8em;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .preset-chip:hover:not(:disabled) {
+        border-color: var(--successColor);
+        background: rgba(16, 185, 129, 0.1);
+    }
+
+    .preset-chip.active {
+        border-color: var(--successColor);
+        background: var(--successColor);
+        color: white;
+    }
+
+    .preset-chip:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    .seed-description-input {
+        flex: 1;
+        min-width: 150px;
+        padding: 6px 10px;
+        border: 1px solid var(--borderColor);
+        border-radius: var(--baseRadius);
+        font-size: 0.85em;
+        background: var(--baseColor);
+    }
+
+    .seed-description-input:focus {
+        outline: none;
+        border-color: var(--primaryColor);
+    }
+
+    .footer-buttons {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        gap: 10px;
+    }
+
+    /* Success button variant for create + seed */
+    :global(.btn-success) {
+        background: var(--successColor) !important;
+        border-color: var(--successColor) !important;
+    }
+
+    :global(.btn-success:hover:not(:disabled)) {
+        background: #059669 !important;
+        border-color: #059669 !important;
     }
 </style>
